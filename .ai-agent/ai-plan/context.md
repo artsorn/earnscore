@@ -1,59 +1,68 @@
 # Planning Context
 
-## Requirement Interpretation
+## Current Requirement Interpretation
 
-คำว่า “ดึงข้อมูลทั้งหมดเท่าที่จะสามารถดึงได้” ใช้แนวทางสองชั้น:
+Requirement รอบนี้เป็นการซ่อม implementation ที่ผ่านแผนเดิมแล้ว ไม่ใช่ขยาย feature ใหม่ทั่วไป โดยมี observable failures สามกลุ่ม:
 
-- normalize field ที่ระบบต้อง query/render ได้แก่ sport, competition, teams, match time/status, scores และ detail กลุ่ม incidents, stats, lineups, odds, h2h
-- เก็บ payload list/detail ที่เหลือเป็น sanitized raw JSON เพื่อไม่ทิ้ง field ที่ AiScore เพิ่มหรือเปลี่ยน โดยต้องตัด key/section/endpoint ที่เป็น chat ก่อน persistence
+1. ข้อมูลผิด/relations ผิดเมื่อเปิด feed — ต้องกลับไปยืนยัน source runtime ด้วย Chrome DevTools และสร้าง fixtures จาก shape จริง
+2. ข้อมูลถูกอ่านเร็วเกินไป — ต้องมี minimum delay + readiness/stability predicates และ match-specific validation
+3. ลบ `local.db` แล้วยังเห็นข้อมูลเดิม — ต้องแยก local SQLite lifecycle ออกจาก D1/dashboard lifecycle ด้วย dataset generation และ no-cache behavior
 
-คำว่า “event เปลี่ยนก็บันทึก” หมายถึงเก็บ latest state และทำ row dirty เมื่อเนื้อหาเปลี่ยนจริง ไม่จำเป็นต้องสร้าง event-history warehouse. สถานะ finished ต้องเป็น latest state ที่ persist/sync/render ได้ แม้หลัง match หลุดจาก Live list; crawler จึงต้องทำ final reconciliation ให้ match ที่เคย active
+คำว่า “new tab เพื่อเก็บข้อมูลพร้อมๆ กัน” ตีความเป็น crawler-created Chrome targets: dedicated list tab ต่อ sport session และ bounded detail/feed target pool เพื่อเก็บหลาย match พร้อมกัน โดยไม่ใช้ tab ผู้ใช้ร่วมกันและไม่สร้าง tabs แบบไร้ขีดจำกัด
 
-## Verified Project Map
+## Current Project Map
 
-- Rust package/entrypoint: `Cargo.toml`, `src/main.rs`
-- Cloudflare Worker/API/embedded UI: `dashboard/src/index.js`
-- D1 bootstrap schema: `dashboard/schema.sql`
-- Worker configuration/scripts: `dashboard/wrangler.toml`, `dashboard/package.json`
-- ไม่มี test directory หรือ migration directory ใน baseline
+- `src/main.rs` เป็น monolithic Rust entrypoint (~2,000 lines) มี adapters, target selection, SQLite migrations/upserts, D1 sync, CDP router/event loop, iframe detail helper และ unit tests
+- `Cargo.toml` มี `tokio`, `tokio-tungstenite`, `reqwest`, `rusqlite`, `serde`, `uuid`, `rand` ซึ่งเพียงพอสำหรับ target orchestration/generation โดยควรหลีกเลี่ยง dependency ใหม่ถ้าไม่จำเป็น
+- `dashboard/src/index.js` รวม Worker routes และ embedded dashboard; `/api/matches/live` อ่าน D1 และไม่มี concept ของ local DB generation
+- `dashboard/schema.sql` และ `dashboard/migrations/0001_full_payload.sql` เป็น schema ปัจจุบัน; entity PK ยังเป็น upstream ID และไม่มี `dataset_id`
+- fixtures ปัจจุบันมี football/basketball live/finished และ sync batch แต่เป็น simplified shapes; ยังไม่มี target-list, Live-filter readiness หรือ real detail hydration fixtures
 
-Generated project knowledge ระบุ schema/function หลักตรงกับ source ปัจจุบัน: `init_db`, `save_competitions`, `save_teams`, `save_matches`, `sync_worker`, `trigger_state_fetch`, `/api/sync`, `/api/matches/live`, `/api/matches/detail`, `/api/settings`, และ embedded `loadMatches()`
+## Evidence from Current Source
 
-## Source-Site Observations and Discovery Boundary
+- `FootballAdapter::extract_state_js` อ่าน `football/home` หรือ `home`; `BasketballAdapter` อ่าน `basketball` หรือ `basketball/player` และเลือก `matchesData_* | matches | list` โดยไม่มี source-version/readiness metadata
+- `activate_live_js()` หา element ที่ text เท่ากับ `live` และ click แต่ caller เรียกเฉพาะเมื่อ extracted state เป็น null; state ที่มีข้อมูลแต่เป็น filter อื่นจึงผ่านได้
+- initial event ถูก queue ทันทีหลัง script injection; navigation รอ fixed 5 วินาที, iframe detail รอ fixed 3 วินาทีหลัง load และ timeout 15 วินาที
+- `get_websocket_url()` ใช้ matching tab ที่มีอยู่ก่อน แล้ว fallback ไป generic tab; ไม่มี target owner/session ID
+- detail helper อยู่ใน list tab และอ่าน module ตาม `sportId`; response ยืนยันเพียงว่ามี `matchId`, แต่ lifecycle ของ iframe/store reuse ยังไม่แยก target
+- CLI log `cli.db_path` ตาม input ไม่ resolve absolute path/DB identity. Dashboard อ่าน D1 จึงเป็นคนละ persistence layer กับ file ที่ผู้ใช้ลบ
 
-- URL ต้นทางตาม requirement คือ `https://m.aiscore.com/` และ `https://m.aiscore.com/basketball`; ทั้งสองหน้ามี filter `All / Live / Finished / Schedule`
-- HTML ที่อ่านได้จากภายนอกไม่ยืนยัน Vuex module, response endpoint, status mapping หรือ detail shape ที่ runtime ใช้จริง จึงห้ามวางแผนให้ hard-code ชื่อ state จากการคาดเดา
-- ใน Task 2 Coder ต้องใช้ Chrome DevTools MCP/CDP กับทั้งสอง URL ขณะเลือก Live เพื่อยืนยัน target selection, network response shape, state fallback, status IDs และ detail sections. เก็บ fixture แบบย่อ/ตัดข้อมูลส่วนบุคคลเพื่อทำ regression test; ไม่บันทึก chat fixture
-- ถ้า source shape ต่างระหว่างกีฬา ให้ใช้ sport adapter แยกกันและ contract กลางหลัง extraction แทน conditional ที่กระจายทั่วไฟล์
+## Source Discovery Rules
 
-## Data and Migration Decisions
+- Task 05 Coder ต้องใช้ Chrome DevTools MCP กับ `https://m.aiscore.com/` และ `https://m.aiscore.com/basketball` ขณะเลือก All และ Live เพื่อเปรียบเทียบ DOM active marker, network responses, Vue/Nuxt store และ detail page hydration
+- Prefer network response contract เป็น primary source เมื่อ response body/IDs เชื่อม relations ได้; store/DOM เป็น readiness/fallback เท่านั้น. ถ้าต้องใช้ store ให้ระบุ exact module path และ invariant ที่ fixture/tests ยืนยัน
+- ต้องสร้าง sanitized fixtures จาก actual shape โดยลดข้อมูลเหลือ minimum reproducible fields และตัด chat. ห้าม commit full production payload, token, cookie หรือ personal/browser data
+- status IDs และ score indices ต้องแยกต่อกีฬาและยืนยันด้วย live + finished examples; ห้ามใช้ mapping เดิมโดยไม่มี evidence
 
-- รักษาตาราง normalized เดิมเพื่อ compatibility กับ Worker/UI
-- เพิ่ม sanitized `raw_json` (และ metadata ที่จำเป็นต่อ change/sync) ให้ entity/match/detail แทนการเพิ่ม column ทุก field ของ AiScore
-- SQLite migration ใน `init_db` ต้อง idempotent ด้วย schema inspection ก่อน `ALTER TABLE`; เปิด WAL, busy timeout และ transaction สั้นเพื่อให้สอง process เขียน file เดียวกันได้
-- `dashboard/schema.sql` เป็น final bootstrap schema สำหรับ D1 ใหม่; migration file ใหม่ใช้กับ D1 เดิมและต้องไม่ drop/rename ตารางเดิม
-- canonical JSON comparison หรือเทียบค่าที่ persist แล้วต้องทำให้ unchanged reconciliation ไม่ reset `synced`/`updated_at`
-- chat exclusion เป็น allow/deny boundary ก่อน DB write: ตัด known chat keys/sections และไม่รับ network responses จาก chat endpoints. Worker ยังต้อง reject/strip chat-like top-level sections เพื่อเป็น defense in depth
+## Dataset Generation Decision
 
-## Sync and Settings Decisions
+- SQLite file แต่ละไฟล์มี persistent `dataset_id` UUID ใน settings/metadata; สร้างครั้งเดียวเมื่อ DB ใหม่และคงเดิมตลอดอายุ file
+- normalized rows และ sync payload ทุกชนิดต้องระบุ `dataset_id`. D1 เก็บ generation บน rows และมี active dataset metadata
+- เมื่อ sync generation ใหม่ครั้งแรก Worker เปลี่ยน active generation แบบ atomic; list/detail APIs filter active generation จึงไม่แสดง unmatched old rows
+- Entity PK เดิมอาจคงไว้ได้หาก upsert เปลี่ยน `dataset_id` ของ rows ที่เห็นใน generation ใหม่ และ filter ซ่อน rows ที่ไม่ถูกส่งใหม่. Migration design ต้องพิสูจน์ behavior นี้กับ overlapping IDs และ old-only IDs ก่อนเลือก composite key
+- สอง CLI processes ที่เปิด DB เดียวกันต้องอ่าน generation เดียวกันภายใต้ transaction. DB ต่าง path คือคนละ generation และต้อง log/warn เพื่อให้ operator เห็น
+- DB unlink/replacement ขณะรันต้องตรวจด้วย canonical path + file identity/generation probe ก่อน persistence/sync. ห้ามใช้ connection/claimed rows จาก generation เก่าหลัง detect replacement
 
-- ทั้งสอง CLI process อาจชี้ SQLite เดียวกัน แต่ต้องมี lease/claim ที่ atomic เพื่อให้ process เดียวส่ง batch ณ เวลาใดเวลาหนึ่ง
-- competitions, teams, matches และ details ต้องมี dirty lifecycle ของตนเอง ไม่อาศัยเฉพาะ relation จาก dirty matches
-- D1 ingestion ใช้ upsert และ bounded batches; response ระบุรายการ/จำนวนที่รับสำเร็จและ authoritative `sync_interval_mins`
-- Rust อ่านค่า interval local ตอนเริ่ม และ refresh จาก acknowledgement/settings ของ Worker เพื่อให้ค่าที่แก้บน dashboard มีผลจริง; invalid/missing value ใช้ safe default และมี minimum bound ป้องกัน tight loop
-- settings write ที่เปลี่ยน sync/token ต้องไม่เผย token ใน GET response/log และต้องคง auth contract ที่ Rust ใช้อยู่
+## Readiness and Concurrency Decisions
 
-## UI Decisions
+- minimum navigation/detail delay เป็น CLI-configurable milliseconds แต่ success ต้องขึ้นกับ predicate: correct URL, document ready, Live active marker, expected store/response present และ snapshot stable อย่างน้อยสอง probes
+- timeout ต้องคืน typed failure/retry ไม่ persist empty/partial payload. Logs ระบุ target ID, sport, match ID, stage และ elapsed time
+- list target หนึ่งตัวต่อ process; detail targets มี bounded concurrency ด้วย semaphore/queue. Target ที่สร้างต้อง track owner/session ID และปิดใน success, timeout, cancellation และ reconnect paths
+- detail save ต้องตรวจ requested match ID == hydrated match ID และ relation to current dataset/sport; response จาก match ก่อนหน้าต้อง discard
 
-- List API ใช้ `LEFT JOIN match_details` หรือไม่ join detail เพื่อให้คู่ใหม่แสดงได้ทันที
-- UI ใช้ sport-aware score/status/logo renderer และแสดง fallback เมื่อ field/detail ไม่มี แทนการซ่อน match
-- detail renderer แสดงกลุ่ม known ก่อน แล้วแสดง extra non-chat sections แบบ generic JSON-safe view เมื่อเหมาะสม
-- escape text/attribute และ validate asset URLs จาก payload ก่อนประกอบ HTML เพื่อไม่ให้ raw upstream data กลายเป็น script injection
+## D1 and Dashboard Decisions
+
+- D1 เป็น durable remote store จึงไม่ควรถูกลบอัตโนมัติเมื่อ local file หาย; correctness มาจาก active-generation filtering
+- `/api/sync` ต้องรับ/validate generation, activate safely และ acknowledge generation เดียวกับ batch. Rust mark synced เฉพาะ acknowledgement ที่ตรงกัน
+- `/api/matches/live` response ควรมี dataset ID, generation activation/freshness timestamps และ empty state เมื่อ generation ใหม่ยังไม่มี sport data
+- `/api/matches/detail` ต้อง join/validate match กับ active generation ไม่ใช่ lookup `match_id` อย่างเดียว
+- API/client fetch ใช้ `Cache-Control: no-store`/`cache: 'no-store'`; UI แสดง source generation/freshness เพื่อแยก “ไม่มีข้อมูลใหม่” จาก “โหลดล้มเหลว”
 
 ## Constraints
 
-- implementation ใช้ Rust เป็นหลัก; Worker/UI ยังอยู่ใน JavaScript ตามโครงสร้างเดิม
-- task size เป็น MEDIUM, detail level เป็น high, จำกัดไม่เกิน 4 tasks
-- แผนนี้ไม่เพิ่ม implementation file นอก scope ที่ระบุในแต่ละ task และไม่รวม `.ai-agent/**`/agent state เป็น implementation scope
-- การทดสอบ live source ต้องใช้ browser ที่เปิด remote debugging; automated tests ใช้ sanitized fixtures เพื่อไม่ผูก CI กับ availability ของ AiScore
+- Current runtime classification: LARGE, detail level high, maximum 8 task files
+- Task 01–04 เดิมมีสถานะ Passed; active repair uses Task 05–08 เพื่อให้รวมทั้งหมดไม่เกิน 8
+- implementation ใช้ Rust เป็นหลักและคง JavaScript Worker/UI ตามโครงสร้างเดิม
+- ไม่อ่าน runtime logs/history ใน repair mode false; plan อาศัย compact package, generated knowledge และ targeted current sources เท่านั้น
+- implementation scope ของ task ต้องไม่รวม `.ai-agent/**`, root `AGENTS.md`, `.gitignore` หรือ agent state
 

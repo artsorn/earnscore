@@ -1,3 +1,6 @@
+## Status
+Passed
+
 # Task 04: Football/Basketball Live Dashboard and Detail View
 
 ## Outcome
