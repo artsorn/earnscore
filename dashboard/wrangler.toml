@@ -1,0 +1,12 @@
+name = "earnscore-dashboard"
+main = "src/index.js"
+compatibility_date = "2024-03-01"
+
+[vars]
+# Used as fallback if no token in D1
+API_TOKEN = "super-secret-token"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "earnscore-db"
+database_id = "placeholder-d1-database-uuid"

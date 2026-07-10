@@ -1,0 +1,842 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+AGENT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+PROJECT_ROOT="$(cd "$AGENT_DIR/.." && pwd)"
+CMD="${1:-help}"; shift || true
+
+VERSION_FILE="$AGENT_DIR/VERSION"
+CURRENT_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+if [[ -f "$AGENT_DIR/scripts/agent-load-env.sh" ]]; then
+  # shellcheck disable=SC1090
+  source "$AGENT_DIR/scripts/agent-load-env.sh"
+  load_agent_env "$AGENT_DIR"
+fi
+if [[ -f "$AGENT_DIR/scripts/agent-codex-retry.sh" ]]; then source "$AGENT_DIR/scripts/agent-codex-retry.sh"; fi
+if [[ -f "$AGENT_DIR/scripts/agent-task-size.sh" ]]; then source "$AGENT_DIR/scripts/agent-task-size.sh"; fi
+
+bootstrap_project() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git command not found; Git is required by ScopeGuard and reviewer diff generation." >&2
+    return 127
+  fi
+  if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$PROJECT_ROOT" init -q
+    echo "Initialized Git repository: $PROJECT_ROOT"
+  fi
+  mkdir -p "$PROJECT_ROOT/.agent"
+  if [[ ! -e "$PROJECT_ROOT/.agent/requirement.md" ]]; then
+    cat > "$PROJECT_ROOT/.agent/requirement.md" <<'EOF'
+<!-- Describe the desired outcome, constraints, acceptance criteria, and validation here. -->
+EOF
+    echo "Created requirement entry: .agent/requirement.md"
+  fi
+}
+
+require_requirement() {
+  local requirement="$PROJECT_ROOT/.agent/requirement.md"
+  if ! python3 - "$requirement" <<'PY'
+import re, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(1)
+text = path.read_text(encoding="utf-8", errors="replace")
+text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+meaningful = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+raise SystemExit(0 if meaningful else 1)
+PY
+  then
+    echo "Requirement is missing or empty: .agent/requirement.md" >&2
+    echo "Describe the target outcome and acceptance criteria, then run: .ai-agent/bin/aia plan" >&2
+    return 2
+  fi
+}
+
+show_effective_config() {
+  local role key cli configured effective
+  echo "Profile: ${AIA_PROFILE:-balanced}"
+  printf '%-16s %-8s %s\n' "ROLE" "CLI" "EFFECTIVE MODEL"
+  for role in planner coder reviewer reviewer-final; do
+    key="$(agent_role_config_key "$role")"
+    cli="$(agent_cli_for_role "$role")" || return $?
+    configured="${key}_MODEL"
+    configured="${!configured:-}"
+    effective="$(agent_effective_model_for_role "$role" "$configured" "$cli")" || return $?
+    printf '%-16s %-8s %s\n' "$role" "$cli" "$effective"
+  done
+  echo "Inline context package: ${INLINE_CONTEXT_PACKAGE:-false}"
+  echo "Persistent sessions: ${USE_PERSISTENT_SESSIONS:-true} (scope=${PERSISTENT_SESSION_SCOPE:-task})"
+}
+
+planner_task_detail_level() {
+  local level="${PLANNER_TASK_DETAIL_LEVEL:-high}"
+  case "$level" in
+    low|medium|high|extra-high) ;;
+    *)
+      echo "Invalid PLANNER_TASK_DETAIL_LEVEL: $level. Expected low, medium, high, or extra-high." >&2
+      return 2
+      ;;
+  esac
+  printf '%s' "$level"
+}
+
+print_planner_detail_append() {
+  local level="$1"
+  cat <<EOF
+
+---
+# Planner Task Detail Level
+
+Configured level: $level
+Task size: ${TASK_SIZE:-unknown}
+Max tasks from planner: ${MAX_TASKS_FROM_PLANNER:-unlimited}
+
+EOF
+  if [[ "${TASK_SIZE:-}" == "SMALL" ]]; then
+    cat <<'EOF'
+Small task planning rules:
+- Create exactly one task unless there is a clear technical reason to split.
+- Keep the task focused on the inferred allowed edit area.
+- Do not include backend, database, migrations, scripts, auth, or admin files unless the requirement explicitly mentions them.
+EOF
+  fi
+  case "$level" in
+    low)
+      cat <<'EOF'
+Planning detail rules for `low`:
+- Prefer fewer, broader tasks when the work is tightly related and the coding model is strong enough to bridge a few implicit sub-steps.
+- Split only at clear boundaries such as backend vs frontend vs migration.
+- A low-detail task may include 2-4 closely related implementation steps, but it still must have a clear validation path and explicit file scope.
+EOF
+      ;;
+    medium)
+      cat <<'EOF'
+Planning detail rules for `medium`:
+- Break work into moderate-sized tasks with one clear outcome per task.
+- Separate routing, data/model changes, UI work, and validation when they can be completed independently.
+- Aim for tasks that a mid-capability coding model can finish without needing to infer major hidden subtasks.
+- A medium-detail task can still bundle a few tightly coupled edits, but should avoid mixing unrelated surfaces.
+EOF
+      ;;
+    high)
+      cat <<'EOF'
+Planning detail rules for `high`:
+- Break work into small tasks with explicit outcomes, validation, and scope.
+- Separate schema/migration, backend handlers, route wiring, frontend consumption, and admin UI into distinct tasks whenever practical.
+- Assume the coding model benefits from narrow, concrete steps and explicit file scope.
+- A high-detail task should usually represent one implementation concern and one main validation target.
+EOF
+      ;;
+    extra-high)
+      cat <<'EOF'
+Planning detail rules for `extra-high`:
+- Break work into very small, highly explicit tasks suitable for lower-cost coding models.
+- Prefer many narrowly-scoped tasks over a few broad tasks. When in doubt, split further.
+- Treat extra-high as an atomic-planning mode: each task must represent one small concern that can be completed end-to-end without the coder needing to invent missing sub-steps.
+- Separate discovery/contract alignment, schema seed changes, each migration, each route wiring step, each backend behavior branch, each error/empty-state branch, each frontend entrypoint, each admin surface, each UI state, and each validation gap into distinct tasks whenever possible.
+- Each task must include exact files, exact behavior change, exact validation, and enough context that a weaker coding model can execute it directly.
+- Do not produce a task that says or implies "and related changes", "wire everything up", "handle edge cases", or other bundled hidden work. Spell those out as separate tasks.
+- If one task would require touching multiple layers or more than one meaningful implementation step, split it into multiple sequential tasks unless the work is inseparable.
+- The goal of `extra-high` is that a low-capability model can finish one task cleanly, pass review, and move to the next task without planner reinterpretation.
+EOF
+      ;;
+  esac
+}
+
+usage() {
+  cat <<USAGE
+code-agent-token-lite $CURRENT_VERSION
+
+Usage:
+  .ai-agent/bin/aia <command>
+
+Commands:
+  version             Show installed version
+  init                Bootstrap Git and .agent/requirement.md for a blank project
+  doctor              Check required folders/files
+  config              Show resolved profile, role CLIs, and effective models
+  status              Show current task/runtime status
+  monitor [watch]     Show live runtime dashboard (use watch for refresh loop)
+  tail                Follow live agent events log
+  progress            Show task progress and current stage
+  restart             Clear runtime state for a new instruction/planning run
+  reset-sessions      Clear saved Codex session ids only
+  tokens              Show recorded Codex token usage
+  task-files          Show implementation changed files, excluding agent state
+  task-diff           Show reviewer-safe implementation diff
+  task-size           Classify current requirement/task size and show adaptive settings
+  scope <cmd>         Run ScopeGuard: check|preflight|checkpoint|allowed|changed|diff
+  graph <cmd>         CodeGraph status|check|update|ensure
+  scan <cmd>          Knowledge Engine status|check|update|ensure
+  refresh             Rebuild CodeGraph, knowledge, and runtime context
+  context             Ensure graph/scan, then rebuild runtime-context.md and compact package
+  plan                Ensure graph/scan, then run Planner prompt
+  plan grill-start    Create draft-plan.md and first grill questions only
+  plan grill-next     Read grill answers, revise plan, and ask remaining blockers
+  plan approve        Mark current grill round approved and freeze the plan
+  plan freeze         Freeze approved grill plan into overview/context/tasks
+  run [options]       Ensure graph/scan, then run all tasks loop
+  docs                Ensure graph/scan, then prepare docs/README context
+  prompt <role>       Print merged prompt: planner|coder|reviewer|reviewer-final
+  migrate             Run pending migrations
+  rollback [stamp]    Restore latest or selected backup
+  diff                Show changes against MANIFEST.sha256
+  verify              Verify manifest, scripts, and required files
+  pack [out.zip]      Build a distributable zip from this package
+  release <version>   Set VERSION, regenerate manifest, verify, and pack zip
+  clean               Remove transient runtime files only
+  help                Show this help
+USAGE
+}
+
+run_usage() {
+  cat <<USAGE
+Usage:
+  .ai-agent/bin/aia run [options]
+
+Options:
+  --final-reviewer-fail-mode <stop|plan-code|review-code>
+      stop: fail the run when Final Reviewer writes FAIL/BLOCKED.
+      plan-code: let Planner directly edit code until the final goal is satisfied, then rerun Final Reviewer.
+      review-code: let Reviewer directly edit code until the final goal is satisfied, then rerun Final Reviewer.
+      planner-code is accepted as a backward-compatible alias for plan-code.
+
+  --final-reviewer-fix-rounds <n>
+      Number of final-fix coding rounds before giving up. Default: FINAL_REVIEWER_FIX_ROUNDS or 1.
+
+Environment:
+  USE_PERSISTENT_SESSIONS=false
+      Disable role session reuse and preserve old fresh-session behavior.
+
+  PERSISTENT_SESSION_SCOPE=task|role
+      task: reuse sessions within the current task only. This is the default for lower token growth.
+      role: reuse one long-lived session per role across the whole run.
+
+  RESET_SESSIONS=true
+      Clear saved session ids before running.
+USAGE
+}
+
+run_migrations() {
+  local state="$AGENT_DIR/state/migrations.done"
+  mkdir -p "$(dirname "$state")"
+  touch "$state"
+  local ran=0
+  shopt -s nullglob
+  for m in "$AGENT_DIR"/migrations/*.sh; do
+    local name; name="$(basename "$m" .sh)"
+    if ! grep -qxF "$name" "$state"; then
+      bash "$m" "$PROJECT_ROOT"
+      echo "$name" >> "$state"
+      echo "✓ migration $name"
+      ran=1
+    fi
+  done
+  [[ "$ran" == 1 ]] || echo "No pending migrations."
+}
+
+find_current_task_cli() {
+  if [[ -n "${CURRENT_TASK:-}" && -f "${CURRENT_TASK:-}" ]]; then echo "$CURRENT_TASK"; return 0; fi
+  local status_json="${STATUS_JSON:-$AGENT_DIR/generated/status.json}"
+  [[ -f "$status_json" ]] || status_json="$AGENT_DIR/generated/runtime/status.json"
+  if [[ -f "$status_json" ]]; then
+    local status_task
+    status_task="$(python3 - "$status_json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding='utf-8')).get('task') or '')
+except Exception:
+    pass
+PY
+)"
+    if [[ -n "$status_task" && -f "$status_task" ]]; then echo "$status_task"; return 0; fi
+  fi
+  find "$AGENT_DIR/ai-plan/tasks" -maxdepth 1 -type f -name 'task-*.md' 2>/dev/null | sort | while read -r f; do
+    status="$(awk '/^## Status/{getline; print; exit}' "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]' | xargs || true)"
+    case "$status" in
+      passed|done|complete|completed) continue ;;
+      pending|failed|"in progress"|"pending review"|"") echo "$f"; break ;;
+      *) echo "$f"; break ;;
+    esac
+  done
+}
+
+make_manifest_tmp() {
+  local out="$1"
+  cd "$AGENT_DIR"
+  find . -type f \
+    ! -path './generated/*' \
+    ! -path './runtime/*' \
+    ! -path './cache/*' \
+    ! -path './knowledge/*' \
+    ! -path './custom/*' \
+    ! -path './state/*' \
+    ! -path './backups/*' \
+    ! -path './config/user.env' \
+    ! -name 'MANIFEST.sha256' \
+    ! -name '.DS_Store' \
+    -print0 \
+  | sort -z \
+  | xargs -0 sha256sum \
+  | sed 's#  \./#  #' > "$out"
+}
+
+show_token_usage() {
+  local usage_file="$AGENT_DIR/generated/runtime/token-usage.jsonl"
+  if [[ ! -s "$usage_file" ]]; then
+    echo "No token usage recorded yet: $usage_file"
+    echo "Token usage is recorded from future aia plan/run executions."
+    return 0
+  fi
+  python3 - "$usage_file" <<'PY'
+import json, sys
+from collections import defaultdict
+
+path = sys.argv[1]
+rows = []
+with open(path, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("tokens") is not None:
+            rows.append(row)
+
+if not rows:
+    print(f"No parsed token usage rows in {path}")
+    raise SystemExit
+
+total = sum(int(r.get("tokens") or 0) for r in rows)
+by_role = defaultdict(int)
+for r in rows:
+    by_role[r.get("role") or "unknown"] += int(r.get("tokens") or 0)
+
+print(f"Token usage file : {path}")
+print(f"Total recorded   : {total:,}")
+print("By role          : " + ", ".join(f"{k}={v:,}" for k, v in sorted(by_role.items())))
+print("")
+print("Recent runs")
+for r in rows[-12:]:
+    task = r.get("task") or ""
+    if len(task) > 54:
+        task = "..." + task[-51:]
+    print(
+        f"- {r.get('timestamp','')} "
+        f"{r.get('role','unknown')} round={r.get('round','')} "
+        f"model={r.get('model','')} tokens={int(r.get('tokens') or 0):,} "
+        f"task={task}"
+    )
+PY
+}
+
+reset_role_sessions() {
+  local dir="$AGENT_DIR/generated/runtime/sessions"
+  if [[ -d "$dir" ]]; then
+    find "$dir" -type f -name '*_session_id.txt' -delete 2>/dev/null || true
+  fi
+  echo "Reset saved sessions"
+}
+
+record_token_usage() {
+  local role="$1" model="$2" log_file="$3" task="${4:-}"
+  [[ -s "$log_file" ]] || return 0
+  python3 - "$AGENT_DIR/generated/runtime/token-usage.jsonl" "$log_file" "$role" "$model" "$task" <<'PY'
+import datetime, json, re, sys
+out, log_file, role, model, task = sys.argv[1:6]
+text = open(log_file, encoding="utf-8", errors="replace").read()
+patterns = [
+    r"tokens\s+used\s*[:\n ]\s*([0-9][0-9,]*)",
+    r"total[_ ]tokens\s*[=:]\s*([0-9][0-9,]*)",
+    r"total\s+tokens\s*[:=]\s*([0-9][0-9,]*)",
+]
+tokens = None
+for pattern in patterns:
+    matches = re.findall(pattern, text, flags=re.I)
+    if matches:
+        tokens = int(matches[-1].replace(",", ""))
+        break
+if tokens is None:
+    raise SystemExit(0)
+row = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "role": role,
+    "model": model,
+    "round": 0,
+    "task": task,
+    "tokens": tokens,
+    "log_file": log_file,
+}
+with open(out, "a", encoding="utf-8") as f:
+    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+PY
+}
+
+case "$CMD" in
+  version)
+    echo "$CURRENT_VERSION"
+    ;;
+  init)
+    bootstrap_project
+    ;;
+  doctor)
+    ok=1
+    for p in AGENTS.md prompts scripts ai-plan generated config custom bin/aia bin/agent scripts/agent-codegraph.sh scripts/agent-context-package.sh scripts/agent-task-size.sh scripts/agent-knowledge-scan.sh scripts/agent-git-paths.sh MANIFEST.sha256 VERSION; do
+      if [[ -e "$AGENT_DIR/$p" ]]; then echo "✓ .ai-agent/$p"; else echo "✗ .ai-agent/$p missing"; ok=0; fi
+    done
+    if git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo "✓ Git repository ready"; else echo "✗ Git repository missing; run: .ai-agent/bin/aia init"; ok=0; fi
+    if require_requirement >/dev/null 2>&1; then echo "✓ .agent/requirement.md has content"; else echo "! .agent/requirement.md is empty (required before plan)"; fi
+    mapfile -t selected_clis < <(for role in planner coder reviewer reviewer-final; do agent_cli_for_role "$role"; echo; done | sort -u)
+    for selected_cli in "${selected_clis[@]}"; do
+      if command -v "$selected_cli" >/dev/null 2>&1; then echo "✓ selected CLI found: $selected_cli ($(command -v "$selected_cli"))"; else echo "✗ selected CLI missing: $selected_cli"; ok=0; fi
+    done
+    echo
+    show_effective_config || ok=0
+    exit $(( ok == 1 ? 0 : 1 ))
+    ;;
+  config)
+    show_effective_config
+    ;;
+  status)
+    if [[ -x "$AGENT_DIR/scripts/agent-status.sh" ]]; then bash "$AGENT_DIR/scripts/agent-status.sh"; else echo "No status script."; fi
+    ;;
+  monitor)
+    sub="${1:-once}"
+    bash "$AGENT_DIR/scripts/agent-monitor.sh" "$sub"
+    ;;
+  tail)
+    mkdir -p "$AGENT_DIR/generated/runtime"
+    touch "$AGENT_DIR/generated/runtime/events.log"
+    tail -f "$AGENT_DIR/generated/runtime/events.log"
+    ;;
+  progress)
+    bash "$AGENT_DIR/scripts/agent-progress.sh"
+    ;;
+  restart)
+    mkdir -p "$AGENT_DIR/generated/runtime"
+    stamp="$(date -Iseconds)"
+    archive_stamp="$(date +%Y%m%d-%H%M%S)"
+    if [[ -s "$AGENT_DIR/generated/runtime/token-usage.jsonl" ]]; then
+      mv "$AGENT_DIR/generated/runtime/token-usage.jsonl" "$AGENT_DIR/generated/runtime/token-usage.$archive_stamp.jsonl"
+    fi
+    rm -f \
+      "$AGENT_DIR/generated/status.json" \
+      "$AGENT_DIR/generated/runtime/status.json" \
+      "$AGENT_DIR/generated/runtime/loop-verdict.txt" \
+      "$AGENT_DIR/generated/runtime/final-verdict.txt" \
+      "$AGENT_DIR/generated/runtime/runtime-context.md" \
+      "$AGENT_DIR/generated/runtime/context-package.md" \
+      "$AGENT_DIR/generated/runtime/context-package.meta.json" \
+      "$AGENT_DIR/generated/runtime/context-manifest.txt" \
+      "$AGENT_DIR/generated/runtime/context-escalation.txt" \
+      "$AGENT_DIR/generated/runtime/search-allowlist.txt" \
+      "$AGENT_DIR/generated/runtime/reviewer-summary.md" \
+      "$AGENT_DIR/generated/runtime/task-size.txt" \
+      "$AGENT_DIR/generated/runtime/task-type.txt" \
+      "$AGENT_DIR/generated/runtime/task-size.env" \
+      "$AGENT_DIR/generated/runtime/task-size.json" \
+      "$AGENT_DIR/generated/runtime/inferred-allowed-area.txt" \
+      "$AGENT_DIR/generated/runtime/planning-isolation.txt" \
+      "$AGENT_DIR/generated/runtime/reviewer-diff.patch" \
+      "$AGENT_DIR/generated/runtime/reviewer-files.txt" \
+      "$AGENT_DIR/generated/runtime/reviewer-scope.txt" \
+      "$AGENT_DIR/generated/runtime/merged-"*.prompt.md \
+      "$AGENT_DIR/generated/runtime/planner.log" \
+      "$AGENT_DIR/generated/runtime/reviewer-final.log" \
+      "$AGENT_DIR/generated/runtime/coder-"*.log \
+      "$AGENT_DIR/generated/runtime/reviewer-"*.log \
+      "$AGENT_DIR/generated/runtime/planner-"*.log \
+      "$AGENT_DIR/generated/runtime/reviewer-final-"*.log \
+      2>/dev/null || true
+    rm -rf "$AGENT_DIR/generated/runtime/task-checkpoints" 2>/dev/null || true
+    printf '%s [restart] runtime cleared for new instruction/planning run\n' "$stamp" >> "$AGENT_DIR/generated/runtime/events.log"
+    echo "Restarted agent runtime."
+    echo "Next: .ai-agent/bin/aia plan  # for a new plan"
+    echo "Next: .ai-agent/bin/aia run   # for pending tasks"
+    ;;
+  reset-sessions)
+    reset_role_sessions
+    ;;
+  tokens)
+    show_token_usage
+    ;;
+  task-files)
+    bash "$AGENT_DIR/scripts/agent-scope-guard.sh" changed
+    ;;
+  task-diff)
+    task="${1:-${CURRENT_TASK:-$(find_current_task_cli || true)}}"
+    bash "$AGENT_DIR/scripts/agent-scope-guard.sh" diff "$task" "${ROUND:-0}"
+    ;;
+  task-size)
+    if declare -F agent_task_adaptive_apply >/dev/null 2>&1; then
+      agent_task_adaptive_apply "${1:-context}" "$AGENT_DIR" "$PROJECT_ROOT" >/dev/null || true
+      cat "$AGENT_DIR/generated/runtime/task-size.json"
+    else
+      echo "Task size classifier missing." >&2
+      exit 1
+    fi
+    ;;
+  scope)
+    sub="${1:-check}"; shift || true
+    if [[ "$sub" == "check" && "$#" -eq 0 ]]; then
+      task="$(find_current_task_cli || true)"
+      [[ -n "$task" ]] || { echo "No current task found." >&2; exit 1; }
+      set -- "$task"
+    fi
+    if [[ "$sub" == "check" ]]; then
+      AUTO_RESTORE_OUT_OF_SCOPE="${SCOPE_CHECK_AUTO_RESTORE:-false}" bash "$AGENT_DIR/scripts/agent-scope-guard.sh" "$sub" "$@"
+    else
+      bash "$AGENT_DIR/scripts/agent-scope-guard.sh" "$sub" "$@"
+    fi
+    ;;
+
+  graph)
+    sub="${1:-status}"
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" "$sub"
+    ;;
+  scan)
+    sub="${1:-status}"
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" "$sub"
+    ;;
+  refresh)
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" update
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" update
+    CONTEXT_SKIP_ENSURE=true bash "$AGENT_DIR/scripts/agent-context-build.sh"
+    ;;
+  plan)
+    bootstrap_project >/dev/null
+    require_requirement
+    sub="${1:-}"
+    case "$sub" in
+      grill-start|grill-next|approve|freeze)
+        AI_DIR="$AGENT_DIR" PROJECT_ROOT="$PROJECT_ROOT" bash "$AGENT_DIR/scripts/agent-planner-grill.sh" "$sub"
+        exit $?
+        ;;
+      start|next)
+        AI_DIR="$AGENT_DIR" PROJECT_ROOT="$PROJECT_ROOT" bash "$AGENT_DIR/scripts/agent-planner-grill.sh" "grill-$sub"
+        exit $?
+        ;;
+      "")
+        if [[ "${PLANNER_GRILL_REQUIRED:-false}" == "true" ]]; then
+          AI_DIR="$AGENT_DIR" PROJECT_ROOT="$PROJECT_ROOT" bash "$AGENT_DIR/scripts/agent-planner-grill.sh" start
+          exit $?
+        fi
+        ;;
+      *)
+        echo "Unknown plan option: $sub" >&2
+        echo "Usage: .ai-agent/bin/aia plan [grill-start|grill-next|approve|freeze]" >&2
+        exit 2
+        ;;
+    esac
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" ensure >/dev/null || true
+    if declare -F agent_task_adaptive_apply >/dev/null 2>&1; then
+      agent_task_adaptive_apply planner "$AGENT_DIR" "$PROJECT_ROOT" >/dev/null || true
+    fi
+    CONTEXT_SKIP_ENSURE=true CONTEXT_ROLE=planner CONTEXT_MODE=balanced bash "$AGENT_DIR/scripts/agent-context-build.sh" >/dev/null || true
+    {
+      echo "# Invocation Context"
+      echo
+      echo "- Role: planner"
+      echo "- Compact context package: .ai-agent/generated/runtime/context-package.md"
+      echo "- Search allowlist: .ai-agent/generated/runtime/search-allowlist.txt"
+      echo "- Runtime context: .ai-agent/generated/runtime/runtime-context.md"
+      echo "- Repair mode: false"
+      echo
+      echo "---"
+      echo
+      if [[ "${INLINE_CONTEXT_PACKAGE:-false}" == "true" && -s "$AGENT_DIR/generated/runtime/context-package.md" ]]; then
+        cat "$AGENT_DIR/generated/runtime/context-package.md"
+        echo
+        echo "# End Compact Context Package"
+        echo
+        echo "---"
+        echo
+      fi
+      "$AGENT_DIR/bin/aia" prompt planner
+    } > "$AGENT_DIR/generated/runtime/merged-planner.prompt.md"
+    model="${PLANNER_MODEL:-gpt-5.6-sol}"
+    cli="${PLANNER_CLI:-codex}"
+    effort="${PLANNER_LEVEL:-xhigh}"
+    sandbox="${SANDBOX:-workspace-write}"
+    timeout_value="${PLANNER_TIMEOUT:-180m}"
+    planner_log="$AGENT_DIR/generated/runtime/planner.log"
+    : > "$planner_log"
+    set +e
+    run_agent_role "planner" "$AGENT_DIR/generated/runtime/merged-planner.prompt.md" "$model" "$cli" "$timeout_value" "$planner_log" "$effort" "$sandbox"
+    code=$?
+    set -e
+    record_token_usage "planner" "$model" "$planner_log" "plan"
+    exit "$code"
+    ;;
+  run|loop)
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        --final-reviewer-fail-mode)
+          FINAL_REVIEWER_FAIL_MODE="${2:-}"; export FINAL_REVIEWER_FAIL_MODE; shift 2 ;;
+        --final-reviewer-fix-rounds)
+          FINAL_REVIEWER_FIX_ROUNDS="${2:-}"; export FINAL_REVIEWER_FIX_ROUNDS; shift 2 ;;
+        -h|--help)
+          run_usage; exit 0 ;;
+        *)
+          echo "Unknown run option: $1" >&2
+          run_usage >&2
+          exit 2 ;;
+      esac
+    done
+    if [[ "${RESET_SESSIONS:-false}" == "true" ]]; then
+      reset_role_sessions
+    fi
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-loop-all-tasks.sh"
+    ;;
+  docs)
+    sub="${1:-auto}"
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" ensure >/dev/null || true
+    mkdir -p "$AGENT_DIR/generated/knowledge"
+    cat > "$AGENT_DIR/generated/knowledge/README-build-context.md" <<DOCS
+# README Build Context
+
+Generated: $(date -Iseconds)
+
+Use this as lightweight source context for updating README.md.
+
+## Project Summary
+
+$(cat "$AGENT_DIR/generated/cache/project-summary.json" 2>/dev/null || true)
+
+## CodeGraph
+
+$(sed -n '1,260p' "$AGENT_DIR/generated/cache/codegraph-project.md" 2>/dev/null || true)
+
+## Knowledge Files
+
+- .ai-agent/generated/knowledge/architecture.md
+- .ai-agent/generated/knowledge/api.md
+- .ai-agent/generated/knowledge/database.md
+- .ai-agent/generated/knowledge/frontend.md
+- .ai-agent/generated/knowledge/documentation.md
+
+## Knowledge Excerpts
+
+### Architecture
+
+$(sed -n '1,220p' "$AGENT_DIR/generated/knowledge/architecture.md" 2>/dev/null || true)
+
+### API
+
+$(sed -n '1,220p' "$AGENT_DIR/generated/knowledge/api.md" 2>/dev/null || true)
+
+### Database
+
+$(sed -n '1,220p' "$AGENT_DIR/generated/knowledge/database.md" 2>/dev/null || true)
+
+### Frontend
+
+$(sed -n '1,220p' "$AGENT_DIR/generated/knowledge/frontend.md" 2>/dev/null || true)
+DOCS
+    echo "$AGENT_DIR/generated/knowledge/README-build-context.md"
+    if [[ "$sub" == "build" || "$sub" == "auto" ]]; then
+      echo "Next: ask Codex to update README.md using .ai-agent/generated/knowledge/README-build-context.md"
+    fi
+    ;;
+  context)
+    bash "$AGENT_DIR/scripts/agent-codegraph.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-knowledge-scan.sh" ensure >/dev/null || true
+    bash "$AGENT_DIR/scripts/agent-context-build.sh"
+    ;;
+  prompt)
+    role="${1:-}"
+    case "$role" in
+      planner) base="$AGENT_DIR/prompts/planner-start.prompt.md"; extra="$AGENT_DIR/custom/prompts/planner.append.md" ;;
+      coder) base="$AGENT_DIR/prompts/coder-once.prompt.md"; extra="$AGENT_DIR/custom/prompts/coder.append.md" ;;
+      reviewer) base="$AGENT_DIR/prompts/reviewer-fast.prompt.md"; extra="$AGENT_DIR/custom/prompts/reviewer.append.md" ;;
+      reviewer-final) base="$AGENT_DIR/prompts/reviewer-final.prompt.md"; extra="$AGENT_DIR/custom/prompts/reviewer-final.append.md" ;;
+      *) echo "Usage: .ai-agent/bin/aia prompt planner|coder|reviewer|reviewer-final" >&2; exit 2 ;;
+    esac
+    cat "$base"
+    if [[ "$role" == "planner" ]]; then
+      level="$(planner_task_detail_level)"
+      print_planner_detail_append "$level"
+    fi
+    if [[ -s "$extra" ]]; then printf '\n\n---\n# Project Custom Append\n\n'; cat "$extra"; fi
+    ;;
+  migrate)
+    run_migrations
+    ;;
+  rollback)
+    stamp="${1:-}"
+    backup_root="$AGENT_DIR/backups"
+    if [[ -z "$stamp" ]]; then
+      stamp="$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tail -n1 || true)"
+    fi
+    [[ -n "$stamp" && -d "$backup_root/$stamp" ]] || { echo "No backup found." >&2; exit 1; }
+    rsync -a "$backup_root/$stamp/" "$AGENT_DIR/"
+    echo "Restored backup: $stamp"
+    ;;
+  diff)
+    cd "$AGENT_DIR"
+    if [[ ! -f MANIFEST.sha256 ]]; then echo "MANIFEST.sha256 missing" >&2; exit 1; fi
+    tmp="$(mktemp)"
+    make_manifest_tmp "$tmp"
+    echo "Changed:"
+    while read -r hash rel; do
+      [[ -n "${rel:-}" ]] || continue
+      new_hash="$(awk -v f="$rel" '$2 == f {print $1}' "$tmp" || true)"
+      [[ -n "$new_hash" && "$new_hash" != "$hash" ]] && echo "  $rel"
+    done < MANIFEST.sha256
+    echo "Added:"
+    while read -r hash rel; do
+      [[ -n "${rel:-}" ]] || continue
+      grep -q "  $rel$" MANIFEST.sha256 || echo "  $rel"
+    done < "$tmp"
+    echo "Deleted:"
+    while read -r hash rel; do
+      [[ -n "${rel:-}" ]] || continue
+      [[ -f "$rel" ]] || echo "  $rel"
+    done < MANIFEST.sha256
+    rm -f "$tmp"
+    ;;
+  verify)
+    ok=1
+    cd "$AGENT_DIR"
+    [[ -s VERSION ]] && echo "✓ VERSION: $(cat VERSION)" || { echo "✗ VERSION missing"; ok=0; }
+    [[ -s MANIFEST.sha256 ]] && echo "✓ MANIFEST.sha256" || { echo "✗ MANIFEST.sha256 missing"; ok=0; }
+    for p in AGENTS.md prompts scripts ai-plan generated config custom bin/aia bin/agent scripts/agent-codegraph.sh scripts/agent-context-package.sh scripts/agent-task-size.sh scripts/agent-knowledge-scan.sh scripts/agent-git-paths.sh; do
+      [[ -e "$p" ]] && echo "✓ $p" || { echo "✗ $p missing"; ok=0; }
+    done
+    if [[ -s MANIFEST.sha256 ]]; then
+      while read -r hash rel; do
+        [[ -n "${rel:-}" ]] || continue
+        if [[ ! -f "$rel" ]]; then
+          echo "✗ missing manifest file: $rel"; ok=0; continue
+        fi
+        current="$(sha256sum "$rel" | awk '{print $1}')"
+        if [[ "$current" != "$hash" ]]; then
+          echo "✗ manifest hash mismatch: $rel"; ok=0
+        fi
+      done < MANIFEST.sha256
+    fi
+    shopt -s nullglob
+    for sh in scripts/*.sh migrations/*.sh bin/aia bin/agent; do
+      bash -n "$sh" && echo "✓ syntax $sh" || { echo "✗ syntax $sh"; ok=0; }
+    done
+    if [[ -x scripts/agent-parser-regression-test.sh ]]; then
+      scripts/agent-parser-regression-test.sh && echo "✓ parser regression tests" || { echo "✗ parser regression tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-final-fail-mode-test.sh ]]; then
+      scripts/agent-final-fail-mode-test.sh && echo "✓ final reviewer fail mode tests" || { echo "✗ final reviewer fail mode tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-persistent-session-test.sh ]]; then
+      scripts/agent-persistent-session-test.sh && echo "✓ persistent session tests" || { echo "✗ persistent session tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-agy-adapter-test.sh ]]; then
+      scripts/agent-agy-adapter-test.sh && echo "✓ AGY adapter tests" || { echo "✗ AGY adapter tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-blank-project-test.sh ]]; then
+      scripts/agent-blank-project-test.sh && echo "✓ blank project tests" || { echo "✗ blank project tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-config-examples-test.sh ]]; then
+      scripts/agent-config-examples-test.sh && echo "✓ config example tests" || { echo "✗ config example tests"; ok=0; }
+    fi
+    exit $(( ok == 1 ? 0 : 1 ))
+    ;;
+  pack)
+    out="${1:-}"
+    pkg_root="$(cd "$AGENT_DIR/.." && pwd)"
+    pkg_name="$(basename "$pkg_root")"
+    version="$(cat "$AGENT_DIR/VERSION" 2>/dev/null || echo unknown)"
+    if [[ -z "$out" ]]; then out="$(dirname "$pkg_root")/${pkg_name}-v${version}.zip"; fi
+    if command -v zip >/dev/null 2>&1; then
+      (cd "$(dirname "$pkg_root")" && zip -qr "$out" "$pkg_name" \
+        -x "$pkg_name/agent/generated/*" \
+        -x "$pkg_name/agent/runtime/*" \
+        -x "$pkg_name/agent/cache/*" \
+        -x "$pkg_name/agent/knowledge/*" \
+        -x "$pkg_name/agent/state/*" \
+        -x "$pkg_name/agent/backups/*" \
+        -x "$pkg_name/agent/config/user.env" \
+        -x "$pkg_name/agent/custom/prompts/*.append.md")
+    else
+      python3 - "$pkg_root" "$out" <<'PY'
+import os, sys, zipfile
+
+pkg_root, out = sys.argv[1:3]
+base = os.path.dirname(pkg_root)
+pkg_name = os.path.basename(pkg_root)
+exclude_prefixes = (
+    f"{pkg_name}/agent/generated/",
+    f"{pkg_name}/agent/runtime/",
+    f"{pkg_name}/agent/cache/",
+    f"{pkg_name}/agent/knowledge/",
+    f"{pkg_name}/agent/state/",
+    f"{pkg_name}/agent/backups/",
+)
+exclude_exact = {f"{pkg_name}/agent/config/user.env"}
+
+def excluded(rel):
+    if rel in exclude_exact:
+        return True
+    if any(rel.startswith(prefix) for prefix in exclude_prefixes):
+        return True
+    return rel.startswith(f"{pkg_name}/agent/custom/prompts/") and rel.endswith(".append.md")
+
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, dirnames, filenames in os.walk(pkg_root):
+        dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__"}]
+        for name in filenames:
+            if name == ".DS_Store":
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, base).replace(os.sep, "/")
+            if excluded(rel):
+                continue
+            zf.write(path, rel)
+PY
+    fi
+    echo "Packed: $out"
+    ;;
+  release)
+    new_version="${1:-}"
+    [[ -n "$new_version" ]] || { echo "Usage: .ai-agent/bin/aia release <version>" >&2; exit 2; }
+    echo "$new_version" > "$AGENT_DIR/VERSION"
+    bash "$AGENT_DIR/scripts/update-manifest.sh"
+    "$AGENT_DIR/bin/aia" verify
+    "$AGENT_DIR/bin/aia" pack
+    ;;
+  clean)
+    rm -f \
+      "$AGENT_DIR/generated/runtime/runtime-context.md" \
+      "$AGENT_DIR/generated/runtime/context-package.md" \
+      "$AGENT_DIR/generated/runtime/context-package.meta.json" \
+      "$AGENT_DIR/generated/runtime/context-manifest.txt" \
+      "$AGENT_DIR/generated/runtime/context-escalation.txt" \
+      "$AGENT_DIR/generated/runtime/search-allowlist.txt" \
+      "$AGENT_DIR/generated/runtime/reviewer-summary.md" \
+      "$AGENT_DIR/generated/runtime/task-size.txt" \
+      "$AGENT_DIR/generated/runtime/task-type.txt" \
+      "$AGENT_DIR/generated/runtime/task-size.env" \
+      "$AGENT_DIR/generated/runtime/task-size.json" \
+      "$AGENT_DIR/generated/runtime/inferred-allowed-area.txt" \
+      "$AGENT_DIR/generated/runtime/planning-isolation.txt" \
+      "$AGENT_DIR/generated/runtime/merged-"*.prompt.md \
+      2>/dev/null || true
+    echo "Cleaned transient runtime files."
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

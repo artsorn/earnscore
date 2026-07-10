@@ -1,0 +1,50 @@
+
+# AI agent generated files
+.ai-agent/generated/
+.ai-agent/runtime/
+.ai-agent/cache/
+.ai-agent/logs/
+.ai-agent/tmp/
+.ai-agent/knowledge/
+.ai-agent/state/
+.ai-agent/backups/
+
+
+# Rust build
+/target/
+**/target/
+
+# Node.js
+node_modules/
+**/node_modules/
+
+# Cloudflare local state
+.wrangler/
+**/.wrangler/
+
+# Local databases
+local.db
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+tmp/
+temp/
