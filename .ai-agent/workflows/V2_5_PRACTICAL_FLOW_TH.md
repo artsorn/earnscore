@@ -14,9 +14,8 @@
 ## 2. Blank Project
 
 ```bash
-mkdir my-cli
-bash /path/to/code-agent-token-lite/install.sh "$PWD/my-cli"
 cd my-cli
+bash /mnt/d/home/aitools/code-agent-token-lite/install.sh "$PWD/"
 .ai-agent/bin/aia doctor
 ```
 

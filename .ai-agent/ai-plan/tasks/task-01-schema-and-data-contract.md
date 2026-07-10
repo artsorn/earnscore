@@ -1,3 +1,6 @@
+## Status
+Passed
+
 # Task 01: Schema, Migration, and Full-Payload Contract
 
 ## Outcome

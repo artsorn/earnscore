@@ -301,8 +301,9 @@ run_task_agent_role() {
     echo "BUG: run_task_agent_role requires model and role" >&2
     exit 2
   fi
-  local cli
+  local cli effective_model
   cli="$(agent_cli_for_role "$role")" || exit $?
+  effective_model="$(agent_effective_model_for_role "$role" "$model" "$cli")" || exit $?
   local prompt_file="$RUNTIME/merged-${role}.prompt.md"
   local effort=""
   local repair_mode="${REPAIR_MODE:-false}"
@@ -348,8 +349,8 @@ run_task_agent_role() {
     fi
     "$AI_DIR/bin/aia" prompt "$role"
   } > "$prompt_file"
-  event "$role" "started cli=$cli model=$model effort=${effort:-default}"
-  write_status "$role" "$TASK" "$round" "Running $role with $cli/$model" ""
+  event "$role" "started cli=$cli model=$effective_model effort=${effort:-default}"
+  write_status "$role" "$TASK" "$round" "Running $role with $cli/$effective_model" ""
   local output_log="$RUNTIME/${role}-round-${round}.log"
   local code=0
   : > "$output_log"
@@ -357,7 +358,7 @@ run_task_agent_role() {
   CODEX_SESSION_SCOPE_ID="$TASK" run_agent_role "$role" "$prompt_file" "$model" "$cli" "$CODEX_TIMEOUT" "$output_log" "$effort" "$SANDBOX"
   code=$?
   set -e
-  record_token_usage "$role" "$model" "$round" "$output_log"
+  record_token_usage "$role" "$effective_model" "$round" "$output_log"
   if [[ "$code" -ne 0 ]]; then
     event "$role" "failed exit=$code"
     return "$code"
@@ -407,7 +408,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
     CONTEXT_MODE="$CONTEXT_MODE" CODEGRAPH_MODE="$CODEGRAPH_MODE" CURRENT_TASK="$TASK" bash "$AI_DIR/scripts/agent-context-build.sh" >/dev/null || true
   fi
 
-  echo "== Coder: $CODER_MODEL (${CODER_CLI}) =="
+  echo "== Coder: $(agent_effective_model_for_role coder "$CODER_MODEL" "$CODER_CLI") (${CODER_CLI}) =="
   run_task_agent_role "$CODER_MODEL" "coder"
 
   if [[ "$STRICT_SCOPE" == "true" || "$REVIEW_ALLOWED_ONLY" == "true" ]]; then
@@ -440,7 +441,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
   if declare -F prepare_reviewer_diff >/dev/null 2>&1; then
     prepare_reviewer_diff "$TASK" "$round"
   fi
-  echo "== Fast Reviewer: $REVIEWER_MODEL (${REVIEWER_CLI}) =="
+  echo "== Fast Reviewer: $(agent_effective_model_for_role reviewer "$REVIEWER_MODEL" "$REVIEWER_CLI") (${REVIEWER_CLI}) =="
   if [[ "$FAST_REVIEW_UNIT_TEST" == "true" ]]; then
     echo "  [review-scope] FAST_REVIEW_UNIT_TEST=true — unit test enabled in Fast Reviewer"
     event "fast-reviewer" "unit_test=enabled"

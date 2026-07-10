@@ -2,6 +2,36 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Helper to sanitize chat/message properties recursively
+    const sanitizeObj = (val) => {
+      if (val === null || val === undefined) return val;
+      if (Array.isArray(val)) {
+        return val.map(sanitizeObj);
+      }
+      if (typeof val === "object") {
+        const cleaned = {};
+        for (const key of Object.keys(val)) {
+          const lower = key.toLowerCase();
+          const isChat = lower === "chat" ||
+                         lower === "message" ||
+                         lower === "messages" ||
+                         lower === "comment" ||
+                         lower === "comments" ||
+                         lower === "messageroom" ||
+                         lower === "commentroom" ||
+                         lower === "chatroom" ||
+                         lower.includes("chat") ||
+                         lower.includes("message") ||
+                         lower.includes("comment");
+          if (!isChat) {
+            cleaned[key] = sanitizeObj(val[key]);
+          }
+        }
+        return cleaned;
+      }
+      return val;
+    };
+
     // Authentication helper
     const checkAuth = async (req) => {
       const authHeader = req.headers.get("Authorization");
@@ -22,57 +52,80 @@ export default {
     // 1. API: Receive synced data from Rust CLI
     if (url.pathname === "/api/sync" && request.method === "POST") {
       if (!(await checkAuth(request))) {
-        return new Response("Unauthorized", { status: 401 });
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
       }
 
       try {
-        const data = await request.json();
-        const { matches, match_details, teams, competitions } = data;
+        const rawBody = await request.text();
+        let data;
+        try {
+          data = JSON.parse(rawBody);
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "Invalid JSON payload" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
 
-        // Start a batch execution on D1
+        const { matches, match_details, teams, competitions } = data;
         const statements = [];
+        const syncedIds = {
+          competitions: [],
+          teams: [],
+          matches: [],
+          match_details: []
+        };
 
         // Save competitions
         if (competitions && Array.isArray(competitions)) {
           for (const c of competitions) {
+            if (!c.id || !c.sport_id || !c.name) continue;
+            const cleaned = sanitizeObj(c);
             statements.push(
               env.DB.prepare(
-                "INSERT INTO competitions (id, sport_id, name, logo, slug, country_name, country_logo) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET name=excluded.name, logo=excluded.logo, slug=excluded.slug, country_name=excluded.country_name, country_logo=excluded.country_logo"
-              ).bind(c.id, c.sport_id, c.name, c.logo, c.slug, c.country_name, c.country_logo)
+                "INSERT INTO competitions (id, sport_id, name, logo, slug, country_name, country_logo, raw_payload, synced, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name, logo=excluded.logo, slug=excluded.slug, country_name=excluded.country_name, country_logo=excluded.country_logo, raw_payload=excluded.raw_payload, synced=1, updated_at=datetime('now')"
+              ).bind(cleaned.id, cleaned.sport_id, cleaned.name, cleaned.logo || null, cleaned.slug || null, cleaned.country_name || null, cleaned.country_logo || null, JSON.stringify(cleaned))
             );
+            syncedIds.competitions.push(c.id);
           }
         }
 
         // Save teams
         if (teams && Array.isArray(teams)) {
           for (const t of teams) {
+            if (!t.id || !t.sport_id || !t.name) continue;
+            const cleaned = sanitizeObj(t);
             statements.push(
               env.DB.prepare(
-                "INSERT INTO teams (id, sport_id, name, logo, slug) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name, logo=excluded.logo, slug=excluded.slug"
-              ).bind(t.id, t.sport_id, t.name, t.logo, t.slug)
+                "INSERT INTO teams (id, sport_id, name, logo, slug, raw_payload, synced, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name, logo=excluded.logo, slug=excluded.slug, raw_payload=excluded.raw_payload, synced=1, updated_at=datetime('now')"
+              ).bind(cleaned.id, cleaned.sport_id, cleaned.name, cleaned.logo || null, cleaned.slug || null, JSON.stringify(cleaned))
             );
+            syncedIds.teams.push(t.id);
           }
         }
 
         // Save matches
         if (matches && Array.isArray(matches)) {
           for (const m of matches) {
+            if (!m.id || !m.sport_id || !m.competition_id || !m.home_team_id || !m.away_team_id) continue;
+            const cleaned = sanitizeObj(m);
             statements.push(
               env.DB.prepare(
-                "INSERT INTO matches (id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now')) ON CONFLICT(id) DO UPDATE SET status_id=excluded.status_id, home_scores=excluded.home_scores, away_scores=excluded.away_scores, updated_at=datetime('now')"
-              ).bind(m.id, m.sport_id, m.competition_id, m.home_team_id, m.away_team_id, m.match_time, m.status_id, m.home_scores, m.away_scores)
+                "INSERT INTO matches (id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores, raw_payload, synced, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, datetime('now')) ON CONFLICT(id) DO UPDATE SET status_id=excluded.status_id, home_scores=excluded.home_scores, away_scores=excluded.away_scores, raw_payload=excluded.raw_payload, synced=1, updated_at=datetime('now')"
+              ).bind(cleaned.id, cleaned.sport_id, cleaned.competition_id, cleaned.home_team_id, cleaned.away_team_id, cleaned.match_time, cleaned.status_id, cleaned.home_scores, cleaned.away_scores, JSON.stringify(cleaned))
             );
+            syncedIds.matches.push(m.id);
           }
         }
 
         // Save match details
         if (match_details && Array.isArray(match_details)) {
           for (const d of match_details) {
+            if (!d.match_id || !d.sport_id) continue;
+            const cleaned = sanitizeObj(d);
             statements.push(
               env.DB.prepare(
-                "INSERT INTO match_details (match_id, sport_id, incidents, stats, lineups, odds, h2h, last_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(match_id) DO UPDATE SET incidents=excluded.incidents, stats=excluded.stats, lineups=excluded.lineups, odds=excluded.odds, h2h=excluded.h2h, last_updated=excluded.last_updated"
-              ).bind(d.match_id, d.sport_id, d.incidents, d.stats, d.lineups, d.odds, d.h2h, d.last_updated)
+                "INSERT INTO match_details (match_id, sport_id, incidents, stats, lineups, odds, h2h, raw_payload, synced, last_updated, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, datetime('now')) ON CONFLICT(match_id) DO UPDATE SET incidents=excluded.incidents, stats=excluded.stats, lineups=excluded.lineups, odds=excluded.odds, h2h=excluded.h2h, raw_payload=excluded.raw_payload, synced=1, last_updated=excluded.last_updated, updated_at=datetime('now')"
+              ).bind(cleaned.match_id, cleaned.sport_id, cleaned.incidents, cleaned.stats, cleaned.lineups, cleaned.odds, cleaned.h2h, JSON.stringify(cleaned), cleaned.last_updated || null)
             );
+            syncedIds.match_details.push(d.match_id);
           }
         }
 
@@ -80,7 +133,21 @@ export default {
           await env.DB.batch(statements);
         }
 
-        return new Response(JSON.stringify({ success: true, count: matches?.length || 0, details_count: match_details?.length || 0 }), {
+        // Read active sync_interval_mins
+        let syncIntervalMins = 5;
+        try {
+          const settingRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'sync_interval_mins'").first();
+          if (settingRow && settingRow.value) {
+            const parsed = parseInt(settingRow.value, 10);
+            if (!isNaN(parsed)) syncIntervalMins = Math.min(Math.max(parsed, 1), 60);
+          }
+        } catch (_) {}
+
+        return new Response(JSON.stringify({
+          success: true,
+          sync_interval_mins: syncIntervalMins,
+          synced_ids: syncedIds
+        }), {
           headers: { "Content-Type": "application/json" }
         });
       } catch (e) {
@@ -94,27 +161,50 @@ export default {
     // 2. API: Fetch live/today matches
     if (url.pathname === "/api/matches/live" && request.method === "GET") {
       try {
-        const query = `
+        const sportFilter = url.searchParams.get("sport_id");
+        let query = `
           SELECT 
-            m.id, m.sport_id, m.home_team_id, m.away_team_id, m.match_time, m.status_id, m.home_scores, m.away_scores, m.updated_at,
+            m.id, m.sport_id, m.home_team_id, m.away_team_id, m.match_time, m.status_id, m.home_scores, m.away_scores, m.updated_at, m.raw_payload,
             ht.name as home_name, ht.logo as home_logo, ht.slug as home_slug,
             at.name as away_name, at.logo as away_logo, at.slug as away_slug,
             c.name as comp_name, c.logo as comp_logo, c.country_name, c.country_logo
           FROM matches m
-          JOIN match_details md ON m.id = md.match_id
           LEFT JOIN teams ht ON m.home_team_id = ht.id
           LEFT JOIN teams at ON m.away_team_id = at.id
           LEFT JOIN competitions c ON m.competition_id = c.id
-          ORDER BY m.match_time ASC
         `;
-        const { results } = await env.DB.prepare(query).all();
+        const params = [];
+        if (sportFilter) {
+          query += " WHERE m.sport_id = ?1";
+          params.push(parseInt(sportFilter, 10));
+        }
+        query += " ORDER BY m.match_time ASC";
 
-        // Format and parse arrays
-        const formatted = results.map(row => ({
-          ...row,
-          home_scores: JSON.parse(row.home_scores || "[]"),
-          away_scores: JSON.parse(row.away_scores || "[]")
-        }));
+        const stmt = env.DB.prepare(query);
+        const { results } = await (params.length > 0 ? stmt.bind(...params).all() : stmt.all());
+
+        // Format and parse arrays safely
+        const formatted = results.map(row => {
+          let homeScores = [];
+          try {
+            homeScores = JSON.parse(row.home_scores || "[]");
+          } catch (_) {}
+          let awayScores = [];
+          try {
+            awayScores = JSON.parse(row.away_scores || "[]");
+          } catch (_) {}
+          let rawPayload = {};
+          try {
+            rawPayload = JSON.parse(row.raw_payload || "{}");
+          } catch (_) {}
+
+          return {
+            ...row,
+            home_scores: homeScores,
+            away_scores: awayScores,
+            raw_payload: rawPayload
+          };
+        });
 
         return new Response(JSON.stringify(formatted), {
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
@@ -132,7 +222,7 @@ export default {
       try {
         const matchId = url.searchParams.get("match_id");
         if (!matchId) {
-          return new Response(JSON.stringify({ error: "Missing match_id" }), { status: 400, headers: { "Access-Control-Allow-Origin": "*" } });
+          return new Response(JSON.stringify({ error: "Missing match_id" }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
         const result = await env.DB.prepare(
           "SELECT match_id, sport_id, incidents, stats, lineups, odds, h2h, last_updated FROM match_details WHERE match_id = ?1"
@@ -145,13 +235,21 @@ export default {
           });
         }
 
+        const safeParse = (str, fallback) => {
+          try {
+            return JSON.parse(str || fallback);
+          } catch (_) {
+            return JSON.parse(fallback);
+          }
+        };
+
         const formatted = {
           ...result,
-          incidents: JSON.parse(result.incidents || "[]"),
-          stats: JSON.parse(result.stats || "{}"),
-          lineups: JSON.parse(result.lineups || "{}"),
-          odds: JSON.parse(result.odds || "{}"),
-          h2h: JSON.parse(result.h2h || "{}")
+          incidents: safeParse(result.incidents, "[]"),
+          stats: safeParse(result.stats, "{}"),
+          lineups: safeParse(result.lineups, "{}"),
+          odds: safeParse(result.odds, "{}"),
+          h2h: safeParse(result.h2h, "{}")
         };
 
         return new Response(JSON.stringify(formatted), {
@@ -172,37 +270,43 @@ export default {
           const rows = await env.DB.prepare("SELECT key, value FROM settings").all();
           const settings = {};
           rows.results.forEach(r => {
-            if (r.key !== "api_token") { // Hide secret token
+            if (r.key !== "api_token" && r.key !== "uploader_lease_owner" && r.key !== "uploader_lease_expires") { // Hide secret tokens/lease keys
               settings[r.key] = r.value;
             }
           });
           return new Response(JSON.stringify(settings), {
-            headers: { "Content-Type": "application/json" }
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
           });
         } catch (e) {
-          return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+          return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
       }
 
       if (request.method === "POST") {
+        if (!(await checkAuth(request))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
         try {
           const body = await request.json();
           const { sync_interval_mins, detail_update_interval_secs, api_token } = body;
 
           const statements = [];
           if (sync_interval_mins !== undefined) {
+            const val = Math.min(Math.max(parseInt(sync_interval_mins, 10) || 5, 1), 60);
             statements.push(
-              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_interval_mins', ?1)").bind(String(sync_interval_mins))
+              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_interval_mins', ?1)").bind(String(val))
             );
           }
           if (detail_update_interval_secs !== undefined) {
+            const val = Math.min(Math.max(parseInt(detail_update_interval_secs, 10) || 60, 5), 3600);
             statements.push(
-              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('detail_update_interval_secs', ?1)").bind(String(detail_update_interval_secs))
+              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('detail_update_interval_secs', ?1)").bind(String(val))
             );
           }
           if (api_token && api_token.trim() !== "") {
             statements.push(
-              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('api_token', ?1)").bind(api_token)
+              env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('api_token', ?1)").bind(api_token.trim())
             );
           }
 
@@ -210,9 +314,11 @@ export default {
             await env.DB.batch(statements);
           }
 
-          return new Response(JSON.stringify({ success: true }));
+          return new Response(JSON.stringify({ success: true }), {
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+          });
         } catch (e) {
-          return new Response(JSON.stringify({ error: e.message }), { status: 400 });
+          return new Response(JSON.stringify({ error: e.message }), { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
         }
       }
     }

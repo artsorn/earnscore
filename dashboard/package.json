@@ -7,7 +7,9 @@
     "dev": "wrangler dev --port 8080",
     "deploy": "wrangler deploy",
     "d1:init": "wrangler d1 execute earnscore-db --local --file=schema.sql",
-    "d1:init:prod": "wrangler d1 execute earnscore-db --remote --file=schema.sql"
+    "d1:init:prod": "wrangler d1 execute earnscore-db --remote --file=schema.sql",
+    "d1:migrate": "wrangler d1 migrations apply earnscore-db --local",
+    "d1:migrate:prod": "wrangler d1 migrations apply earnscore-db --remote"
   },
   "devDependencies": {
     "wrangler": "^3.60.0"

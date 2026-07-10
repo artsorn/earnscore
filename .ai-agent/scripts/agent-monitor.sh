@@ -7,7 +7,7 @@ STATUS_JSON="${STATUS_JSON:-$AI_DIR/generated/status.json}"
 [[ -f "$STATUS_JSON" ]] || STATUS_JSON="$RUNTIME/status.json"
 EVENTS="$RUNTIME/events.log"
 action="${1:-once}"; interval="${MONITOR_INTERVAL:-2}"
-filtered_git_status() { git status --short 2>/dev/null | grep -vE '^.. \.ai-agent/|^.. \.agent/loop-verdict\.txt$|^.. AGENTS\.md$|^.. \.gitignore$' || true; }
+filtered_git_status() { git status --short --untracked-files=all 2>/dev/null | grep -vE '^.. \.ai-agent/|^.. \.agent/(loop-verdict\.txt|requirement\.md)$|^.. AGENTS\.md$|^.. \.gitignore$' || true; }
 render() {
   clear 2>/dev/null || true
   echo "AI Agent Monitor v$VERSION"

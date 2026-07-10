@@ -17,6 +17,10 @@ cd "$tmp"
 
 git rev-parse --is-inside-work-tree | grep -qx true
 test -f .agent/requirement.md
+blank_status_out="$tmp/.ai-agent/generated/runtime/blank-status.out"
+.ai-agent/bin/aia status > "$blank_status_out"
+grep -q 'Implementation dirty files: 0' "$blank_status_out"
+! grep -q '^HEAD$' "$blank_status_out"
 
 set +e
 .ai-agent/bin/aia plan > "$tmp/empty-plan.out" 2>&1

@@ -1,0 +1,44 @@
+{
+  "matches": [
+    {
+      "id": "foot-match-1",
+      "competition": { "id": "comp-foot" },
+      "homeTeam": { "id": "team-foot-1" },
+      "awayTeam": { "id": "team-foot-2" },
+      "matchTime": 1700000000,
+      "statusId": 8,
+      "homeScores": [2, 0, 0, 0, 0],
+      "awayScores": [1, 0, 0, 0, 0],
+      "chat": {
+        "messages": ["full time!"]
+      },
+      "someOtherField": "preserve-this"
+    }
+  ],
+  "teams": [
+    {
+      "id": "team-foot-1",
+      "name": "Arsenal",
+      "logo": "arsenal.png",
+      "slug": "arsenal"
+    },
+    {
+      "id": "team-foot-2",
+      "name": "Chelsea",
+      "logo": "chelsea.png",
+      "slug": "chelsea"
+    }
+  ],
+  "competitions": [
+    {
+      "id": "comp-foot",
+      "name": "Premier League",
+      "logo": "pl.png",
+      "slug": "premier-league",
+      "country": {
+        "name": "England",
+        "logo": "eng.png"
+      }
+    }
+  ]
+}

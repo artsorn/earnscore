@@ -46,4 +46,15 @@ test "$(resolve_preset "$AI_DIR/config/examples/large-hybrid.env")" = \
 test "$(resolve_preset "$AI_DIR/config/examples/large-agy.env")" = \
   'agy-efficient|LARGE|agy|Gemini 3.1 Pro (High)|agy|Gemini 3.5 Flash (High)|agy|Gemini 3.1 Pro (Low)|agy|Gemini 3.1 Pro (High)'
 
+status_root="$tmp/status-project"
+mkdir -p "$status_root/.ai-agent/config" "$status_root/.ai-agent/scripts" "$status_root/.ai-agent/ai-plan/tasks" "$status_root/.ai-agent/generated/runtime"
+cp "$AI_DIR/config/default.env" "$status_root/.ai-agent/config/default.env"
+cp "$AI_DIR/config/examples/medium-hybrid.env" "$status_root/.ai-agent/config/user.env"
+cp "$AI_DIR/scripts/agent-load-env.sh" "$status_root/.ai-agent/scripts/agent-load-env.sh"
+cp "$AI_DIR/scripts/agent-status.sh" "$status_root/.ai-agent/scripts/agent-status.sh"
+cp "$AI_DIR/VERSION" "$status_root/.ai-agent/VERSION"
+(cd "$status_root" && bash .ai-agent/scripts/agent-status.sh) > "$tmp/status.out"
+grep -q '^Config$' "$tmp/status.out"
+grep -q 'USE_PERSISTENT_SESSIONS.*: true' "$tmp/status.out"
+
 echo "Config example tests passed."

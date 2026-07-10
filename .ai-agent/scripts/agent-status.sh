@@ -2,6 +2,11 @@
 set -euo pipefail
 AI_DIR="${AI_DIR:-.ai-agent}"
 PROJECT_ROOT="$(pwd)"
+if [[ -f "$AI_DIR/scripts/agent-load-env.sh" ]]; then
+  # shellcheck disable=SC1090
+  source "$AI_DIR/scripts/agent-load-env.sh"
+  load_agent_env "$AI_DIR"
+fi
 VERSION="$(cat "$AI_DIR/VERSION" 2>/dev/null || echo unknown)"
 RUNTIME="${RUNTIME_DIR:-$AI_DIR/generated/runtime}"
 STATUS_JSON="${STATUS_JSON:-$AI_DIR/generated/status.json}"
@@ -11,7 +16,7 @@ fmt_elapsed() { local s="${1:-0}"; printf '%02d:%02d:%02d' $((s/3600)) $(((s%360
 status_of() { awk '/^## Status/{getline; print; exit}' "$1" 2>/dev/null | tr '[:upper:]' '[:lower:]' | xargs || true; }
 count_tasks() { find "$AI_DIR/ai-plan/tasks" -maxdepth 1 -type f -name 'task-*.md' 2>/dev/null | wc -l | tr -d ' '; }
 count_status() { local pat="$1"; find "$AI_DIR/ai-plan/tasks" -maxdepth 1 -type f -name 'task-*.md' 2>/dev/null | while read -r f; do status_of "$f" | grep -Eqi "$pat" && echo x || true; done | wc -l | tr -d ' '; }
-filtered_git_status() { git status --short 2>/dev/null | grep -vE '^.. \.ai-agent/|^.. \.agent/loop-verdict\.txt$|^.. AGENTS\.md$|^.. \.gitignore$' || true; }
+filtered_git_status() { git status --short --untracked-files=all 2>/dev/null | grep -vE '^.. \.ai-agent/|^.. \.agent/(loop-verdict\.txt|requirement\.md)$|^.. AGENTS\.md$|^.. \.gitignore$' || true; }
 
 cat <<HEAD
 AI Agent Status v$VERSION
@@ -50,7 +55,8 @@ else
   echo "- No status JSON yet: $STATUS_JSON"
 fi
 
-branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+branch="${branch:-unknown}"
 commit="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
 dirty="$(filtered_git_status | wc -l | tr -d ' ')"
 echo
@@ -70,8 +76,6 @@ echo "- Pending review : $review"
 
 echo
 echo "Config"
-if [[ -f "$AI_DIR/config/default.env" ]]; then source "$AI_DIR/config/default.env"; fi
-if [[ -f "$AI_DIR/config/user.env" ]]; then source "$AI_DIR/config/user.env"; fi
 echo "- STRICT_SCOPE              : ${STRICT_SCOPE:-true}"
 echo "- USE_PERSISTENT_SESSIONS   : ${USE_PERSISTENT_SESSIONS:-true}"
 echo "- PERSISTENT_SESSION_SCOPE  : ${PERSISTENT_SESSION_SCOPE:-task}"

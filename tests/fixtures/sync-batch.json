@@ -1,0 +1,98 @@
+{
+  "competitions": [
+    {
+      "id": "comp-foot-1",
+      "sport_id": 1,
+      "name": "Premier League",
+      "logo": "https://example.com/logo-pl.png",
+      "slug": "premier-league",
+      "country_name": "England",
+      "country_logo": "https://example.com/logo-eng.png"
+    },
+    {
+      "id": "comp-bask-1",
+      "sport_id": 2,
+      "name": "NBA",
+      "logo": "https://example.com/logo-nba.png",
+      "slug": "nba",
+      "country_name": "USA",
+      "country_logo": "https://example.com/logo-usa.png"
+    }
+  ],
+  "teams": [
+    {
+      "id": "team-foot-1",
+      "sport_id": 1,
+      "name": "Arsenal",
+      "logo": "https://example.com/logo-ars.png",
+      "slug": "arsenal"
+    },
+    {
+      "id": "team-foot-2",
+      "sport_id": 1,
+      "name": "Chelsea",
+      "logo": "https://example.com/logo-che.png",
+      "slug": "chelsea"
+    },
+    {
+      "id": "team-bask-1",
+      "sport_id": 2,
+      "name": "Lakers",
+      "logo": "https://example.com/logo-lal.png",
+      "slug": "lakers"
+    },
+    {
+      "id": "team-bask-2",
+      "sport_id": 2,
+      "name": "Warriors",
+      "logo": "https://example.com/logo-gsw.png",
+      "slug": "warriors"
+    }
+  ],
+  "matches": [
+    {
+      "id": "fixture-football-live",
+      "sport_id": 1,
+      "competition_id": "comp-foot-1",
+      "home_team_id": "team-foot-1",
+      "away_team_id": "team-foot-2",
+      "match_time": 1700000000,
+      "status_id": 2,
+      "home_scores": "[1,0,0,0,0]",
+      "away_scores": "[0,0,0,0,0]"
+    },
+    {
+      "id": "fixture-basketball-live",
+      "sport_id": 2,
+      "competition_id": "comp-bask-1",
+      "home_team_id": "team-bask-1",
+      "away_team_id": "team-bask-2",
+      "match_time": 1700000100,
+      "status_id": 2,
+      "home_scores": "[25,20,0,0]",
+      "away_scores": "[22,24,0,0]"
+    }
+  ],
+  "match_details": [
+    {
+      "match_id": "fixture-football-live",
+      "sport_id": 1,
+      "incidents": "[]",
+      "stats": "{\"shotsOnTarget\": [5, 3], \"shotsOffTarget\": [6, 4]}",
+      "lineups": "{}",
+      "odds": "{}",
+      "h2h": "{}",
+      "last_updated": 1700000200
+    },
+    {
+      "match_id": "fixture-basketball-live",
+      "sport_id": 2,
+      "incidents": "[]",
+      "stats": "{}",
+      "lineups": "{}",
+      "odds": "{}",
+      "h2h": "{}",
+      "last_updated": 1700000300
+    }
+  ]
+}

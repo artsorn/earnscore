@@ -1,0 +1,47 @@
+{
+  "matches": [
+    {
+      "id": "bask-match-1",
+      "competition": { "id": "comp-bask" },
+      "homeTeam": { "id": "team-bask-1" },
+      "awayTeam": { "id": "team-bask-2" },
+      "matchTime": 1700000100,
+      "statusId": 2,
+      "homeScores": [25, 25, 0, 0, 0],
+      "awayScores": [20, 22, 0, 0, 0],
+      "chat": {
+        "messages": ["basketball starts!"]
+      },
+      "messageRoom": {
+        "messages": []
+      },
+      "someOtherField": "preserve-bask-this"
+    }
+  ],
+  "teams": [
+    {
+      "id": "team-bask-1",
+      "name": "Lakers",
+      "logo": "lakers.png",
+      "slug": "lakers"
+    },
+    {
+      "id": "team-bask-2",
+      "name": "Celtics",
+      "logo": "celtics.png",
+      "slug": "celtics"
+    }
+  ],
+  "competitions": [
+    {
+      "id": "comp-bask",
+      "name": "NBA",
+      "logo": "nba.png",
+      "slug": "nba",
+      "country": {
+        "name": "USA",
+        "logo": "usa.png"
+      }
+    }
+  ]
+}
