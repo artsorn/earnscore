@@ -1,7 +1,7 @@
 # Task 03: Owned Headless Feed Runtime and Sport Adapters
 
 ## Status
-
+Passed
 Pending
 
 ## Outcome

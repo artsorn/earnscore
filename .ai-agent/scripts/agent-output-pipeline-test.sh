@@ -46,6 +46,25 @@ assert row['cached_input_tokens'] == 12000, row
 assert row['accounting_source'] == 'structured_cli_usage', row
 PY
 
+# Completed command events may contain an enormous aggregated_output with words
+# such as "error" or "failed". Keep that payload only in the exact raw log;
+# otherwise a single JSON line can consume the entire rollout budget.
+json_command_log="$tmp/codex-command.log"
+: > "$json_command_log"
+VISIBLE_LOG_MAX_BYTES=40000 \
+agent_capture_command "$json_command_log" "$tmp/codex-command.raw.log.gz" python3 -c '
+import json
+payload = "error: synthetic diff content " + ("X" * 250000) + " failed"
+print(json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"completed","aggregated_output":payload}}))
+print(json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"failed","aggregated_output":payload}}))
+print(json.dumps({"type":"turn.failed","message":"shared rollout token budget exhausted"}))
+' >/dev/null
+test "$(gzip -cd "$tmp/codex-command.raw.log.gz" | wc -c)" -gt 500000
+test "$(wc -c < "$json_command_log")" -lt 5000
+grep -q '^command_execution: failed$' "$json_command_log"
+grep -q '^turn.failed: shared rollout token budget exhausted$' "$json_command_log"
+! grep -q 'synthetic diff content' "$json_command_log"
+
 validation_runtime="$tmp/runtime"
 AI_DIR="$AI_DIR" RUNTIME_DIR="$validation_runtime" bash "$AI_DIR/scripts/agent-validation.sh" -- bash -c 'echo ok' >/dev/null
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$validation_runtime/validation-latest.json")" = PASS

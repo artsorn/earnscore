@@ -1,0 +1,46 @@
+[
+  {
+    "event_type": "MATCH_DISCOVERED_LIVE",
+    "match_id": "football-001",
+    "sport_id": 1,
+    "source_timestamp": "2026-07-11T12:00:00Z",
+    "received_at": "2026-07-11T12:00:01Z",
+    "payload": {
+      "competition_id": "league-1",
+      "home_team_id": "football-home",
+      "away_team_id": "football-away",
+      "home_scores": [0],
+      "away_scores": [0],
+      "period": "1H",
+      "clock": "00:00"
+    },
+    "evidence": { "source_status": "LIVE", "started": true, "period": "1H", "clock": "00:00" }
+  },
+  {
+    "event_type": "MATCH_SCORE_CHANGED",
+    "match_id": "football-001",
+    "sport_id": 1,
+    "source_timestamp": "2026-07-11T12:15:00Z",
+    "received_at": "2026-07-11T12:15:01Z",
+    "payload": { "home_scores": [1], "away_scores": [0], "period": "1H", "clock": "15:00" },
+    "evidence": { "source_status": "LIVE", "started": true, "home_score": 1, "period": "1H", "clock": "15:00" }
+  },
+  {
+    "event_type": "MATCH_FINISHED",
+    "match_id": "football-001",
+    "sport_id": 1,
+    "source_timestamp": "2026-07-11T13:50:00Z",
+    "received_at": "2026-07-11T13:50:01Z",
+    "payload": { "home_scores": [2], "away_scores": [1] },
+    "evidence": { "source_status": "FINISHED" }
+  },
+  {
+    "event_type": "MATCH_SCORE_CHANGED",
+    "match_id": "football-001",
+    "sport_id": 1,
+    "source_timestamp": "2026-07-11T12:10:00Z",
+    "received_at": "2026-07-11T13:51:00Z",
+    "payload": { "home_scores": [0], "away_scores": [0] },
+    "evidence": { "source_status": "LIVE", "started": true }
+  }
+]

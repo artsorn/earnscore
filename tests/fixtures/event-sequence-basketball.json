@@ -1,0 +1,46 @@
+[
+  {
+    "event_type": "MATCH_DISCOVERED_LIVE",
+    "match_id": "basketball-001",
+    "sport_id": 2,
+    "source_timestamp": "2026-07-11T14:00:00Z",
+    "received_at": "2026-07-11T14:00:01Z",
+    "payload": {
+      "competition_id": "league-2",
+      "home_team_id": "basketball-home",
+      "away_team_id": "basketball-away",
+      "home_scores": [22],
+      "away_scores": [19],
+      "period": "Q2",
+      "clock": "05:30"
+    },
+    "evidence": { "source_status": "IN_PLAY", "started": true, "home_score": 22, "away_score": 19, "period": "Q2", "clock": "05:30" }
+  },
+  {
+    "event_type": "MATCH_SCORE_CHANGED",
+    "match_id": "basketball-001",
+    "sport_id": 2,
+    "source_timestamp": "2026-07-11T14:05:00Z",
+    "received_at": "2026-07-11T14:05:01Z",
+    "payload": { "home_scores": [24], "away_scores": [19], "period": "Q2", "clock": "05:00" },
+    "evidence": { "source_status": "IN_PLAY", "started": true, "home_score": 24, "away_score": 19, "period": "Q2", "clock": "05:00" }
+  },
+  {
+    "event_type": "MATCH_ODDS_CHANGED",
+    "match_id": "basketball-001",
+    "sport_id": 2,
+    "source_timestamp": "2026-07-11T14:06:00Z",
+    "received_at": "2026-07-11T14:06:01Z",
+    "payload": { "market_type": "moneyline", "selection_key": "home", "odds_value": "1.75" },
+    "evidence": { "source_status": "IN_PLAY", "started": true }
+  },
+  {
+    "event_type": "MATCH_FINISHED",
+    "match_id": "basketball-001",
+    "sport_id": 2,
+    "source_timestamp": "2026-07-11T14:45:00Z",
+    "received_at": "2026-07-11T14:45:01Z",
+    "payload": { "home_scores": [88], "away_scores": [81] },
+    "evidence": { "source_status": "FT" }
+  }
+]

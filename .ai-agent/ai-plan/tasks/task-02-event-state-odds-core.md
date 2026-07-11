@@ -1,7 +1,7 @@
 # Task 02: Event, Match-State, Odds, and Transactional Outbox Core
 
 ## Status
-
+Passed
 Pending
 
 ## Outcome

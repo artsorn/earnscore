@@ -16,9 +16,6 @@
       "statusId": 8,
       "homeScores": [105, 100],
       "awayScores": [102, 101],
-      "chat": {
-        "messages": ["finished"]
-      },
       "someOtherField": "preserve-bask-this"
     }
   ],

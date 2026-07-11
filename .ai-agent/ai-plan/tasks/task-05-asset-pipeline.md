@@ -1,7 +1,6 @@
 # Task 05: Ephemeral Asset Pipeline and Local Storage
 
 ## Status
-
 Pending
 
 ## Outcome
@@ -104,4 +103,3 @@ Reviewer must inspect a temporary asset root and query the temporary active DB f
 - src/storage/repositories.rs — Task 02/04 transaction patterns
 - src/main.rs — current competition/team logo fields and sanitizer behavior
 - dashboard/schema.sql — final metadata contract, read-only in this task
-

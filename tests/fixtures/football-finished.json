@@ -16,9 +16,6 @@
       "statusId": 8,
       "homeScores": [2, 0, 0, 0, 0],
       "awayScores": [1, 0, 0, 0, 0],
-      "chat": {
-        "messages": ["full time!"]
-      },
       "someOtherField": "preserve-this"
     }
   ],

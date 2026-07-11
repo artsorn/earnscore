@@ -11,7 +11,11 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
+pub mod domain;
+pub mod feed;
 pub mod storage;
+pub mod detail;
+pub mod assets;
 
 static REQ_ID: AtomicI64 = AtomicI64::new(1000);
 fn next_req_id() -> i64 {
@@ -43,6 +47,30 @@ struct Cli {
     /// Maximum number of detail fetch tabs open simultaneously (1..=10)
     #[arg(long, default_value = "3", value_parser = parse_detail_concurrency)]
     detail_concurrency: usize,
+
+    /// Directory for downloaded assets
+    #[arg(long, default_value = "data/assets")]
+    asset_root: String,
+
+    /// Concurrency limit for downloading assets
+    #[arg(long, default_value = "3")]
+    asset_concurrency: usize,
+
+    /// Delay (ms) between asset downloads
+    #[arg(long, default_value = "500")]
+    asset_delay_ms: u64,
+
+    /// Request timeout (seconds) for asset downloads
+    #[arg(long, default_value = "10")]
+    asset_timeout_secs: u64,
+
+    /// Maximum retries for failed asset downloads
+    #[arg(long, default_value = "3")]
+    asset_max_retries: u32,
+
+    /// Delay (seconds) between failed asset retries
+    #[arg(long, default_value = "2")]
+    asset_retry_delay_secs: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -78,6 +106,8 @@ fn parse_detail_concurrency(s: &str) -> Result<usize, String> {
 enum Commands {
     Football,
     Basketball,
+    /// Run both live sport feeds in one owned headless browser process.
+    Live,
     /// Apply the local v3 migration, optionally after creating a verified backup.
     Migrate {
         #[arg(long)]
@@ -2408,6 +2438,9 @@ async fn send_command(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    
+    // Clean up temporary assets directory
+    let _ = crate::assets::store::clean_temp_assets(&cli.asset_root);
 
     let resolved_db_path = get_absolute_normalized_path(&cli.db_path)?;
 
@@ -2449,14 +2482,197 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     manifest.checksum
                 );
             }
-            let _ = init_db(&resolved_db_path)?;
+            let conn = init_db(&resolved_db_path)?;
             println!(
                 "[Storage] SQLite v3 migration completed: {}",
                 resolved_db_path
             );
+
+            // One-time legacy asset conversion
+            println!("[Storage] Running legacy logo asset conversion...");
+            let repo = storage::repositories::RepositoryUnitOfWork::new(&conn);
+            let client = reqwest::Client::new();
+            match repo.convert_legacy_logos(&client, &cli.asset_root).await {
+                Ok(failures) => {
+                    println!("[Storage] Legacy asset conversion completed.");
+                    if !failures.is_empty() {
+                        println!("[Storage] Failed to convert logos for owners: {:?}", failures);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Storage] Legacy asset conversion failed: {}", e);
+                }
+            }
             return Ok(());
         }
         Commands::Football | Commands::Basketball => {}
+        Commands::Live => {
+            let db_conn = init_db(&resolved_db_path)?;
+            let dataset_id = init_dataset_id(&db_conn)?;
+            db_conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_dataset_id', ?1)",
+                params![dataset_id],
+            )?;
+
+            let config = feed::FeedSessionConfig::default();
+            let browser = std::sync::Arc::new(
+                feed::browser::OwnedBrowser::launch(config.browser.clone())
+                    .await
+                    .map_err(|error| feed::adapters::FeedError::Browser(error.to_string()))?,
+            );
+
+            let football_target = browser
+                .create_target(
+                    feed::browser::TargetRole::Live,
+                    1,
+                    "https://m.aiscore.com/",
+                )
+                .await
+                .map_err(|error| feed::adapters::FeedError::Browser(error.to_string()))?;
+
+            let basketball_target = browser
+                .create_target(
+                    feed::browser::TargetRole::Live,
+                    2,
+                    "https://m.aiscore.com/basketball",
+                )
+                .await
+                .map_err(|error| feed::adapters::FeedError::Browser(error.to_string()))?;
+
+            let mut football = feed::FeedSession::new(
+                feed::adapters::FootballAdapter,
+                browser.clone(),
+                football_target,
+                config.clone(),
+            );
+
+            let mut basketball = feed::FeedSession::new(
+                feed::adapters::BasketballAdapter,
+                browser.clone(),
+                basketball_target,
+                config.clone(),
+            );
+
+            println!(
+                "[Feed] Owned browser started at {} with 2 isolated Live targets",
+                browser.endpoint
+            );
+
+            // Spawn asset coordinator
+            let asset_config = crate::assets::AssetWorkerConfig {
+                concurrency_limit: cli.asset_concurrency,
+                download_delay: Duration::from_millis(cli.asset_delay_ms),
+                timeout: Duration::from_secs(cli.asset_timeout_secs),
+                max_retries: cli.asset_max_retries,
+                retry_delay: Duration::from_secs(cli.asset_retry_delay_secs),
+                asset_root: cli.asset_root.clone(),
+                max_size_bytes: 10 * 1024 * 1024,
+            };
+            let asset_coordinator = Arc::new(crate::assets::AssetCoordinator::new(
+                resolved_db_path.clone(),
+                asset_config,
+            ));
+
+            // Spawn detail coordinator
+            let mut detail_worker_config = detail::DetailWorkerConfig::default();
+            detail_worker_config.concurrency_limit = cli.detail_concurrency;
+            detail_worker_config.min_delay_ms = cli.detail_ready_delay_ms;
+
+            let detail_coord = Arc::new(detail::DetailCoordinator::new(
+                resolved_db_path.clone(),
+                browser.clone(),
+                detail_worker_config,
+                dataset_id.clone(),
+                asset_coordinator,
+            ));
+            let (detail_shutdown_tx, detail_shutdown_rx) = tokio::sync::oneshot::channel();
+            let detail_handle = tokio::spawn(detail_coord.run(detail_shutdown_rx));
+
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            
+            let db_path_clone = resolved_db_path.clone();
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(500));
+
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            break;
+                        }
+                        _ = ticker.tick() => {
+                            if let Ok(conn) = Connection::open(&db_path_clone) {
+                                if let Ok(Some(event)) = football.watchdog_tick().await {
+                                    let evidence = crate::domain::match_state::AdmissionEvidence {
+                                        started: true,
+                                        source_status: Some("Live".to_string()),
+                                        ..Default::default()
+                                    };
+                                    let _ = crate::storage::repositories::apply_event(&conn, &event, &evidence, &[]);
+                                }
+                                match football.poll_once().await {
+                                    Ok(events) => {
+                                        for event in events {
+                                            let evidence = crate::domain::match_state::AdmissionEvidence {
+                                                started: true,
+                                                source_status: Some("Live".to_string()),
+                                                ..Default::default()
+                                            };
+                                            let _ = crate::storage::repositories::apply_event(&conn, &event, &evidence, &[]);
+                                        }
+                                    }
+                                    Err(feed::adapters::FeedError::Disconnected) => {
+                                        let _ = football.reconnect().await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Feed Live] Football session error: {:?}", e);
+                                    }
+                                }
+
+                                if let Ok(Some(event)) = basketball.watchdog_tick().await {
+                                    let evidence = crate::domain::match_state::AdmissionEvidence {
+                                        started: true,
+                                        source_status: Some("Live".to_string()),
+                                        ..Default::default()
+                                    };
+                                    let _ = crate::storage::repositories::apply_event(&conn, &event, &evidence, &[]);
+                                }
+                                match basketball.poll_once().await {
+                                    Ok(events) => {
+                                        for event in events {
+                                            let evidence = crate::domain::match_state::AdmissionEvidence {
+                                                started: true,
+                                                source_status: Some("Live".to_string()),
+                                                ..Default::default()
+                                            };
+                                            let _ = crate::storage::repositories::apply_event(&conn, &event, &evidence, &[]);
+                                        }
+                                    }
+                                    Err(feed::adapters::FeedError::Disconnected) => {
+                                        let _ = basketball.reconnect().await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Feed Live] Basketball session error: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let _ = football.shutdown().await;
+                let _ = basketball.shutdown().await;
+                let _ = browser.shutdown().await;
+                Ok::<(), feed::adapters::FeedError>(())
+            });
+
+            tokio::signal::ctrl_c().await?;
+            println!("[Feed] Interrupt received, stopping sessions...");
+            let _ = shutdown_tx.send(());
+            let _ = detail_shutdown_tx.send(());
+            let _ = handle.await;
+            let _ = detail_handle.await;
+            return Ok(());
+        }
     }
     let _ = init_db(&resolved_db_path)?;
 
@@ -2469,6 +2685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let adapter: Box<dyn SportAdapter> = match cli.command {
         Commands::Football => Box::new(FootballAdapter),
         Commands::Basketball => Box::new(BasketballAdapter),
+        Commands::Live => unreachable!("the owned live runtime returns before crawler startup"),
         Commands::Migrate { .. } | Commands::Backup { .. } | Commands::Restore { .. } => {
             unreachable!("storage subcommands return before crawler startup")
         }
@@ -2500,8 +2717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let readiness_timeout = Duration::from_secs(30);
     let probe_interval = Duration::from_millis(800);
 
-    // Detail concurrency semaphore
-    let detail_sem = Arc::new(Semaphore::new(cli.detail_concurrency));
+
 
     // Track owned list target across reconnects
     let mut owned_list_target: Option<OwnedTarget> = None;
@@ -2835,177 +3051,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
 
-                let mut detail_interval_secs = 60;
-                if let Ok(val) = conn.query_row(
-                    "SELECT value FROM settings WHERE key='detail_update_interval_secs'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    if let Ok(parsed) = val.parse::<i64>() {
-                        detail_interval_secs = parsed;
-                    }
-                }
 
-                let need_details = match get_matches_needing_detail(
-                    &conn,
-                    sport_id,
-                    detail_interval_secs,
-                    &dataset_id,
-                ) {
-                    Ok(list) => list,
-                    Err(e) => {
-                        eprintln!("[Crawler] Error querying matches needing details: {:?}", e);
-                        Vec::new()
-                    }
-                };
 
-                if !need_details.is_empty() {
-                    println!(
-                        "[Crawler] Found {} matches needing detail fetch (concurrency cap={}).",
-                        need_details.len(),
-                        cli.detail_concurrency
-                    );
-                }
-
-                // Launch detail fetches concurrently, bounded by semaphore.
-                // Each detail fetch runs independently — a single failure does not block others.
-                let chrome_url_clone = cli.chrome_url.clone();
-                let detail_ready_delay = cli.detail_ready_delay_ms;
-                let dataset_id_clone = dataset_id.clone();
-                let db_path_clone2 = resolved_db_path.clone();
-                let sem_clone = detail_sem.clone();
-
-                for (match_id, home_slug, away_slug) in need_details {
-                    // DB identity check before launching
-                    if !verify_db_identity(&resolved_db_path, &dataset_id, file_identity) {
-                        println!(
-                            "[Crawler] DB replaced during details launch! Aborting details iteration."
-                        );
-                        break;
-                    }
-
-                    let detail_url = if sport_id == 1 {
-                        format!(
-                            "https://m.aiscore.com/match-{}-{}/{}",
-                            home_slug, away_slug, match_id
-                        )
-                    } else {
-                        format!(
-                            "https://m.aiscore.com/match-basketball-{}-{}/{}",
-                            home_slug, away_slug, match_id
-                        )
-                    };
-
-                    if detail_url.contains("chat")
-                        || detail_url.contains("message")
-                        || detail_url.contains("comment")
-                    {
-                        println!("[Crawler] Skipping chat-like detail URL: {}", detail_url);
-                        continue;
-                    }
-
-                    println!(
-                        "[Crawler] Scheduling detail fetch for match {} (URL: {})...",
-                        match_id, detail_url
-                    );
-
-                    let chrome_url2 = chrome_url_clone.clone();
-                    let ds_id = dataset_id_clone.clone();
-                    let db_path3 = db_path_clone2.clone();
-                    let sem2 = sem_clone.clone();
-                    let mid = match_id.clone();
-                    let sp = sport_id;
-
-                    tokio::spawn(async move {
-                        // Acquire concurrency permit — this enforces the cap
-                        let _permit = sem2.acquire().await.ok()?;
-
-                        println!(
-                            "[Crawler] Fetching detail for match {} via dedicated tab...",
-                            mid
-                        );
-
-                        // Create dedicated Chrome detail tab
-                        let owned_detail =
-                            match create_detail_target(&chrome_url2, &detail_url, &mid, sp).await {
-                                Ok(ot) => ot,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[Crawler] Failed to create detail target for match {}: {}",
-                                        mid, e
-                                    );
-                                    return None;
-                                }
-                            };
-
-                        let result = fetch_detail_from_target(
-                            &owned_detail.websocket_url,
-                            &mid,
-                            sp,
-                            detail_ready_delay,
-                            Duration::from_secs(25),
-                            Duration::from_millis(800),
-                        )
-                        .await;
-
-                        // Always close the detail target after use
-                        close_target(&chrome_url2, &owned_detail.target_id).await;
-
-                        match result {
-                            Ok(validated_detail) => {
-                                // Verify DB identity before writing
-                                let fi = get_file_identity(&db_path3);
-                                if let Ok(conn) = open_db(&db_path3) {
-                                    // Confirm dataset_id still matches
-                                    let current_ds: Option<String> = conn
-                                        .query_row(
-                                            "SELECT value FROM settings WHERE key='active_dataset_id'",
-                                            [],
-                                            |row| row.get(0),
-                                        )
-                                        .optional()
-                                        .unwrap_or(None);
-                                    if current_ds.as_deref() != Some(&ds_id) {
-                                        eprintln!(
-                                            "[Crawler] dataset_id changed before saving detail for match {}; discarding.",
-                                            mid
-                                        );
-                                        return None;
-                                    }
-                                    if fi != get_file_identity(&db_path3) {
-                                        eprintln!(
-                                            "[Crawler] DB identity changed before saving detail for match {}; discarding.",
-                                            mid
-                                        );
-                                        return None;
-                                    }
-                                    if let Err(e) = save_match_detail(
-                                        &conn,
-                                        &mid,
-                                        sp,
-                                        &validated_detail,
-                                        &ds_id,
-                                    ) {
-                                        eprintln!(
-                                            "[Crawler] Error saving match detail for {}: {:?}",
-                                            mid, e
-                                        );
-                                    } else {
-                                        println!(
-                                            "[Crawler] Successfully saved details for match {}.",
-                                            mid
-                                        );
-                                    }
-                                }
-                                Some(())
-                            }
-                            Err(e) => {
-                                eprintln!("[Crawler] Detail fetch failed for match {}: {}", mid, e);
-                                None
-                            }
-                        }
-                    });
-                }
+                // Monolithic direct-detail calls removed in Task 04.
+                // Detail worker now processes details via durable queue.
             }
         }
 
@@ -4462,5 +4511,288 @@ mod tests {
         assert!(stored.5.contains("activatedTabs"));
         assert!(!stored.5.to_ascii_lowercase().contains("chat"));
         assert!(!stored.5.contains("must-not-persist"));
+    }
+
+    #[test]
+    fn asset_validation_images() {
+        use crate::assets::download::validate_image_bytes;
+
+        // PNG
+        let valid_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        assert!(validate_image_bytes(&valid_png, "image/png").is_ok());
+        assert!(validate_image_bytes(&valid_png[0..4], "image/png").is_err());
+
+        // JPEG
+        let valid_jpeg = vec![0xFF, 0xD8, 0xFF, 4, 5, 6];
+        assert!(validate_image_bytes(&valid_jpeg, "image/jpeg").is_ok());
+        assert!(validate_image_bytes(&valid_jpeg[0..2], "image/jpeg").is_err());
+
+        // GIF
+        let valid_gif = b"GIF89a...";
+        assert!(validate_image_bytes(valid_gif, "image/gif").is_ok());
+        assert!(validate_image_bytes(b"GIF87a", "image/gif").is_ok());
+        assert!(validate_image_bytes(b"GIF85a", "image/gif").is_err());
+
+        // WEBP
+        let valid_webp = b"RIFFxxxxWEBPyyyy";
+        assert!(validate_image_bytes(valid_webp, "image/webp").is_ok());
+        assert!(validate_image_bytes(b"RIFFWEBP", "image/webp").is_err());
+
+        // SVG
+        let valid_svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        assert!(validate_image_bytes(valid_svg, "image/svg+xml").is_ok());
+        assert!(validate_image_bytes(b"svg", "image/svg+xml").is_err());
+    }
+
+    #[test]
+    fn asset_atomic_publication() {
+        use crate::assets::store::{publish_asset_file, clean_temp_assets};
+        let temp_root = std::env::temp_dir().join(format!("asset-test-root-{}", uuid::Uuid::new_v4()));
+        let root_str = temp_root.to_string_lossy().to_string();
+
+        let bytes = b"test-image-bytes";
+        let hash = crate::assets::store::calculate_sha256(bytes);
+        
+        let path = publish_asset_file(&root_str, "player", "p123", &hash, "png", bytes).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // Verify clean up
+        clean_temp_assets(&root_str).unwrap();
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn asset_dedup_and_links() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let dataset_id = "test-dataset";
+
+        let repo = storage::repositories::RepositoryUnitOfWork::new(&conn);
+        let temp_root = std::env::temp_dir().join(format!("asset-dedup-{}", uuid::Uuid::new_v4()));
+        let root_str = temp_root.to_string_lossy().to_string();
+
+        let candidates = vec![
+            crate::detail::types::ImageCandidate {
+                url: "https://example.com/logo1.png".to_string(),
+                entity_type: "team".to_string(),
+                entity_id: "t1".to_string(),
+                role: "logo".to_string(),
+            },
+            crate::detail::types::ImageCandidate {
+                url: "https://example.com/logo2.png".to_string(),
+                entity_type: "team".to_string(),
+                entity_id: "t2".to_string(),
+                role: "logo".to_string(),
+            },
+        ];
+
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0];
+        let mut downloaded_results = std::collections::HashMap::new();
+        downloaded_results.insert("https://example.com/logo1.png".to_string(), Ok(crate::assets::download::DownloadedAsset {
+            bytes: bytes.clone(),
+            mime_type: "image/png".to_string(),
+            width: Some(32),
+            height: Some(32),
+        }));
+        downloaded_results.insert("https://example.com/logo2.png".to_string(), Ok(crate::assets::download::DownloadedAsset {
+            bytes: bytes.clone(),
+            mime_type: "image/png".to_string(),
+            width: Some(32),
+            height: Some(32),
+        }));
+
+        let md5_logo1 = format!("asset-{:x}", md5::compute("https://example.com/logo1.png"));
+        let md5_logo2 = format!("asset-{:x}", md5::compute("https://example.com/logo2.png"));
+        let detail_data = serde_json::json!({
+            "matchId": "m1",
+            "logo1": md5_logo1,
+            "logo2": md5_logo2,
+        });
+
+        let hash = "content-hash";
+        repo.save_detail_section_with_assets(
+            "m1",
+            dataset_id,
+            "overview",
+            &detail_data,
+            false,
+            hash,
+            None,
+            &candidates,
+            &downloaded_results,
+            &root_str,
+        ).unwrap();
+
+        let count_assets: i64 = conn.query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_assets, 1);
+
+        let count_links: i64 = conn.query_row("SELECT COUNT(*) FROM asset_links", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_links, 2);
+
+        let saved_json: String = conn.query_row(
+            "SELECT data_json FROM match_detail_data WHERE match_id='m1'", [], |r| r.get(0)
+        ).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&saved_json).unwrap();
+        let asset1 = val["logo1"].as_str().unwrap();
+        let asset2 = val["logo2"].as_str().unwrap();
+        assert_eq!(asset1, asset2);
+        assert!(asset1.starts_with("asset-"));
+        assert_ne!(asset1, "asset-unavailable");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn asset_restart_url_reacquisition() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let dataset_id = "dataset-1";
+        
+        let tx = conn.unchecked_transaction().unwrap();
+        crate::storage::repositories::plan_initial_detail_jobs(&tx, dataset_id, "match-1").unwrap();
+        tx.commit().unwrap();
+
+        let urls_in_db: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM detail_jobs WHERE scheduled_at LIKE '%http%'",
+            [],
+            |r| r.get(0)
+        ).unwrap();
+        assert_eq!(urls_in_db, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_asset_conversion() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE competitions (
+                id TEXT PRIMARY KEY,
+                sport_id INTEGER,
+                name TEXT,
+                logo TEXT,
+                slug TEXT,
+                country_name TEXT,
+                country_logo TEXT,
+                dataset_id TEXT NOT NULL DEFAULT 'legacy-dataset-id'
+            )",
+            [],
+        ).unwrap();
+        
+        conn.execute(
+            "CREATE TABLE teams (
+                id TEXT PRIMARY KEY,
+                sport_id INTEGER,
+                name TEXT,
+                logo TEXT,
+                slug TEXT,
+                dataset_id TEXT NOT NULL DEFAULT 'legacy-dataset-id'
+            )",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO competitions (id, sport_id, name, logo, country_logo)
+             VALUES ('comp-1', 1, 'Premier League', 'https://example.com/logo.png', 'https://example.com/country.png')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO teams (id, sport_id, name, logo)
+             VALUES ('team-1', 1, 'Arsenal', 'https://example.com/team-logo.png')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS assets (
+                asset_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL UNIQUE,
+                storage_key TEXT NOT NULL,
+                mime_type TEXT,
+                byte_size INTEGER,
+                width INTEGER,
+                height INTEGER,
+                status TEXT NOT NULL DEFAULT 'READY',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                provenance TEXT NOT NULL DEFAULT 'local'
+            )",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS asset_links (
+                asset_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (asset_id, dataset_id, entity_type, entity_id, role)
+            )",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS asset_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                scheduled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                started_at TEXT,
+                completed_at TEXT,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                UNIQUE (asset_id, dataset_id)
+            )",
+            [],
+        ).unwrap();
+
+        let repo = storage::repositories::RepositoryUnitOfWork::new(&conn);
+        let temp_root = std::env::temp_dir().join(format!("legacy-convert-{}", uuid::Uuid::new_v4()));
+        let root_str = temp_root.to_string_lossy().to_string();
+
+        let client = reqwest::Client::new();
+        let failures = repo.convert_legacy_logos(&client, &root_str).await.unwrap();
+
+        assert!(failures.contains(&"comp-1".to_string()) || failures.contains(&"team-1".to_string()));
+
+        let updated_comp_logo: String = conn.query_row(
+            "SELECT logo FROM competitions WHERE id='comp-1'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(updated_comp_logo, "asset-unavailable");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn source_url_no_leakage() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%http%'",
+            [],
+            |r| r.get(0)
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn asset_download_failure_on_invalid_url() {
+        let client = reqwest::Client::new();
+        let res = crate::assets::download::download_asset(
+            &client,
+            "https://invalid-domain-that-does-not-exist-12345.com/logo.png",
+            1024,
+            std::time::Duration::from_millis(500),
+            1,
+            std::time::Duration::from_millis(100),
+        ).await;
+        assert!(res.is_err());
     }
 }

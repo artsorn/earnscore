@@ -42,13 +42,13 @@ def raw_writer(path: Path):
     return path.open(mode)
 
 
-def compact_json_line(text: str) -> list[str]:
+def compact_json_line(text: str) -> tuple[bool, list[str]]:
     try:
         data = json.loads(text)
     except Exception:
-        return []
+        return False, []
     if not isinstance(data, dict):
-        return []
+        return False, []
     event_type = str(data.get("type") or "")
     emitted: list[str] = []
     if event_type in {"thread.started", "session", "session.started"}:
@@ -76,7 +76,7 @@ def compact_json_line(text: str) -> list[str]:
                 fields.append(f"{name}={usage[name]}")
         if fields:
             emitted.append("token usage: " + " ".join(fields))
-    return emitted
+    return True, emitted
 
 
 def main() -> int:
@@ -119,8 +119,8 @@ def main() -> int:
             input_lines += 1
             input_bytes += len(payload)
             text = payload.decode("utf-8", "replace").rstrip("\r\n")
-            json_lines = compact_json_line(text)
-            if json_lines:
+            is_json, json_lines = compact_json_line(text)
+            if is_json:
                 json_stream = True
                 for line in json_lines:
                     add(line, force=IMPORTANT.search(line) is not None)
