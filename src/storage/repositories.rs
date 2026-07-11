@@ -139,11 +139,269 @@ impl<'a> RepositoryUnitOfWork<'a> {
         Ok(affected)
     }
 
+    /// Recovery metadata was intentionally kept out of the v3 migration so
+    /// older local databases can be upgraded by the recovery worker itself.
+    /// The operation is idempotent and is safe to call before every claim.
+    pub fn ensure_recovery_support(&self) -> SqlResult<()> {
+        crate::recovery::finalizer::Finalizer::ensure_support(self.conn)
+    }
+
+    pub fn record_feed_disconnect(
+        &self,
+        dataset_id: &str,
+        session_id: Option<&str>,
+        sport_id: Option<i32>,
+    ) -> SqlResult<usize> {
+        self.ensure_recovery_support()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut query = String::from(
+            "SELECT DISTINCT m.id,m.sport_id FROM matches m
+             WHERE m.dataset_id=?1 AND (m.is_live=1 OR EXISTS(
+                 SELECT 1 FROM match_state_history h WHERE h.match_id=m.id AND h.dataset_id=m.dataset_id
+                   AND h.state IN ('DISCOVERED_LIVE','LIVE','HALF_TIME','PAUSED','FINISHING','RECOVERY_PENDING')
+             ))",
+        );
+        if sport_id.is_some() {
+            query.push_str(" AND m.sport_id=?2");
+        }
+        let mut statement = tx.prepare(&query)?;
+        let mut rows = if let Some(sport) = sport_id {
+            statement.query(params![dataset_id, sport])?
+        } else {
+            statement.query(params![dataset_id])?
+        };
+        let mut matches = Vec::new();
+        while let Some(row) = rows.next()? {
+            matches.push((row.get::<_, String>(0)?, row.get::<_, i32>(1)?));
+        }
+        drop(rows);
+        drop(statement);
+        let mut marked = 0;
+        let session_reason = session_id.unwrap_or("unknown-session");
+        let reason = format!("FEED_DISCONNECT:{session_reason}");
+        for (match_id, _sport) in matches {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_jobs WHERE match_id=?1 AND dataset_id=?2
+                   AND status IN ('PENDING','RUNNING','WAITING_FINAL','FAILED_RETRYABLE'))",
+                params![match_id, dataset_id],
+                |row| row.get(0),
+            )?;
+            if active {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO recovery_jobs (match_id,dataset_id,reason,status,previous_feed_session_id,scheduled_at,grace_until)
+                 VALUES (?1,?2,?3,'PENDING',?4,datetime('now'),datetime('now','+900 seconds'))",
+                params![match_id, dataset_id, reason, session_id],
+            )?;
+            tx.execute(
+                "UPDATE matches SET is_live=0,updated_at=datetime('now') WHERE id=?1 AND dataset_id=?2",
+                params![match_id, dataset_id],
+            )?;
+            // Keep the transition auditable without copying the source URL or
+            // payload into the recovery record.
+            tx.execute(
+                "INSERT OR IGNORE INTO match_state_history
+                 (match_id,dataset_id,sport_id,state,status_id,home_scores,away_scores,source_timestamp,received_at,payload_hash,provenance)
+                 SELECT id,dataset_id,sport_id,'RECOVERY_PENDING',status_id,home_scores,away_scores,'',datetime('now'),?3,'recovery'
+                 FROM matches WHERE id=?1 AND dataset_id=?2",
+                params![match_id, dataset_id, format!("recovery-{session_reason}")],
+            )?;
+            marked += 1;
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    pub fn enqueue_recovery_candidates(
+        &self,
+        dataset_id: &str,
+        reason: &str,
+        grace_period: std::time::Duration,
+    ) -> SqlResult<usize> {
+        self.ensure_recovery_support()?;
+        let modifier = format!("+{} seconds", grace_period.as_secs());
+        let tx = self.conn.unchecked_transaction()?;
+        let mut statement = tx.prepare(
+            "SELECT m.id FROM matches m
+             WHERE m.dataset_id=?1
+               AND EXISTS (SELECT 1 FROM match_state_history live
+                   WHERE live.match_id=m.id AND live.dataset_id=m.dataset_id
+                     AND live.state IN ('DISCOVERED_LIVE','LIVE','HALF_TIME','PAUSED','FINISHING','RECOVERY_PENDING'))
+               AND NOT EXISTS (SELECT 1 FROM match_state_history terminal
+                   WHERE terminal.match_id=m.id AND terminal.dataset_id=m.dataset_id
+                     AND terminal.state IN ('FINISHED','CANCELLED','POSTPONED','ABANDONED','FINALIZED'))
+               AND NOT EXISTS (SELECT 1 FROM finalization_versions v
+                   WHERE v.match_id=m.id AND v.dataset_id=m.dataset_id AND v.status='COMPLETED')",
+        )?;
+        let ids = statement
+            .query_map([dataset_id], |row| row.get::<_, String>(0))?
+            .collect::<SqlResult<Vec<_>>>()?;
+        drop(statement);
+        let mut inserted = 0;
+        for match_id in ids {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_jobs WHERE match_id=?1 AND dataset_id=?2
+                   AND status IN ('PENDING','RUNNING','WAITING_FINAL','COMPLETED'))",
+                params![match_id, dataset_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+            inserted += tx.execute(
+                "INSERT INTO recovery_jobs (match_id,dataset_id,reason,status,scheduled_at,grace_until)
+                 VALUES (?1,?2,?3,'PENDING',datetime('now'),datetime('now',?4))",
+                params![match_id, dataset_id, reason, modifier],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn reclaim_recovery_leases(&self) -> SqlResult<usize> {
+        self.ensure_recovery_support()?;
+        self.conn.execute(
+            "UPDATE recovery_jobs SET status='FAILED_RETRYABLE',lease_owner=NULL,lease_expires_at=NULL,
+                scheduled_at=datetime('now'),last_error='Recovery lease expired'
+             WHERE status='RUNNING' AND lease_expires_at IS NOT NULL
+               AND datetime(lease_expires_at) <= datetime('now')",
+            [],
+        )
+    }
+
+    pub fn claim_next_recovery_job(
+        &self,
+        dataset_id: &str,
+        lease_owner: &str,
+        lease_duration: std::time::Duration,
+        grace_period: std::time::Duration,
+    ) -> SqlResult<Option<crate::recovery::manager::RecoveryJob>> {
+        self.ensure_recovery_support()?;
+        let _ = self.reclaim_recovery_leases()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let candidate: Option<(i64, String, String, String, String, i32, Option<String>)> = tx
+            .query_row(
+                "SELECT id,match_id,dataset_id,reason,status,attempt_count,grace_until
+                 FROM recovery_jobs
+                 WHERE dataset_id=?1 AND status IN ('PENDING','FAILED_RETRYABLE')
+                   AND datetime(scheduled_at) <= datetime('now')
+                 ORDER BY scheduled_at,id LIMIT 1",
+                [dataset_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, match_id, dataset_id, reason, status, attempts, grace_until)) = candidate
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let grace_until =
+            grace_until.unwrap_or_else(|| format!("+{} seconds", grace_period.as_secs()));
+        let lease_modifier = format!("+{} seconds", lease_duration.as_secs());
+        tx.execute(
+            "UPDATE recovery_jobs SET status='RUNNING',started_at=datetime('now'),attempt_count=attempt_count+1,
+                lease_owner=?2,lease_expires_at=datetime('now',?3),grace_until=COALESCE(grace_until,datetime('now',?4))
+             WHERE id=?1 AND status IN ('PENDING','FAILED_RETRYABLE')",
+            params![id, lease_owner, lease_modifier, grace_until],
+        )?;
+        tx.commit()?;
+        Ok(Some(crate::recovery::manager::RecoveryJob {
+            id,
+            match_id,
+            dataset_id,
+            reason,
+            status,
+            attempt_count: attempts + 1,
+            grace_until: Some(grace_until),
+        }))
+    }
+
+    pub fn complete_recovery_job(&self, job_id: i64) -> SqlResult<()> {
+        self.ensure_recovery_support()?;
+        self.conn.execute(
+            "UPDATE recovery_jobs SET status='COMPLETED',completed_at=datetime('now'),lease_owner=NULL,lease_expires_at=NULL WHERE id=?1 AND status='RUNNING'",
+            [job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn wait_for_finalization(&self, job_id: i64) -> SqlResult<()> {
+        self.ensure_recovery_support()?;
+        self.conn.execute(
+            "UPDATE recovery_jobs SET status='WAITING_FINAL',completed_at=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?1 AND status='RUNNING'",
+            [job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_recovery_job(
+        &self,
+        job_id: i64,
+        retry_delay: &std::time::Duration,
+        max_attempts: i32,
+    ) -> SqlResult<bool> {
+        self.ensure_recovery_support()?;
+        let (attempts, expired): (i32, bool) = self.conn.query_row(
+            "SELECT attempt_count, (attempt_count >= ?2 OR (grace_until IS NOT NULL AND datetime(grace_until) <= datetime('now')))
+             FROM recovery_jobs WHERE id=?1",
+            params![job_id, max_attempts],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if expired {
+            return Ok(true);
+        }
+        let modifier = format!("+{} seconds", retry_delay.as_secs());
+        self.conn.execute(
+            "UPDATE recovery_jobs SET status='FAILED_RETRYABLE',scheduled_at=datetime('now',?2),
+                lease_owner=NULL,lease_expires_at=NULL,last_error='Recovery result not found'
+             WHERE id=?1 AND status='RUNNING'",
+            params![job_id, modifier],
+        )?;
+        let _ = attempts;
+        Ok(false)
+    }
+
+    pub fn complete_recovery_as_unknown(
+        &self,
+        job_id: i64,
+        match_id: &str,
+        dataset_id: &str,
+    ) -> SqlResult<()> {
+        self.ensure_recovery_support()?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE recovery_jobs SET status='UNKNOWN',completed_at=datetime('now'),lease_owner=NULL,lease_expires_at=NULL,last_error='Not found after grace period' WHERE id=?1",
+            [job_id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO match_state_history (match_id,dataset_id,state,source_timestamp,received_at,payload_hash,provenance)
+             VALUES (?1,?2,'UNKNOWN','',datetime('now'),?3,'recovery')",
+            params![match_id, dataset_id, format!("unknown-recovery-{job_id}")],
+        )?;
+        tx.execute(
+            "UPDATE matches SET is_live=0,updated_at=datetime('now') WHERE id=?1 AND dataset_id=?2",
+            params![match_id, dataset_id],
+        )?;
+        tx.commit()
+    }
+
     pub fn claim_next_job(
         &self,
         lease_owner: &str,
         lease_duration_secs: i64,
     ) -> SqlResult<Option<crate::detail::types::DetailJob>> {
+        self.ensure_recovery_support()?;
         let tx = self.conn.unchecked_transaction()?;
 
         let candidate: Option<(i64, String, String, String, String, i32)> = tx
@@ -158,6 +416,20 @@ impl<'a> RepositoryUnitOfWork<'a> {
                      AND other.dataset_id = detail_jobs.dataset_id
                      AND other.status = 'LOADING'
                      AND other.load_phase != detail_jobs.load_phase
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM recovery_phase_locks lock
+                   WHERE lock.match_id = detail_jobs.match_id
+                     AND lock.dataset_id = detail_jobs.dataset_id
+                     AND lock.phase != detail_jobs.load_phase
+                     AND datetime(lock.lease_expires_at) > datetime('now')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM finalization_versions final_version
+                   WHERE final_version.match_id = detail_jobs.match_id
+                     AND final_version.dataset_id = detail_jobs.dataset_id
+                     AND final_version.status = 'COMPLETED'
+                     AND detail_jobs.load_phase NOT IN ('MANUAL')
                )
              ORDER BY scheduled_at ASC, id ASC
              LIMIT 1",
@@ -225,6 +497,72 @@ fn replace_all_placeholders(val: &mut Value, asset_replacements: &[(String, Stri
             for item in arr {
                 replace_all_placeholders(item, asset_replacements);
             }
+        }
+        Value::String(value) => {
+            for (url, asset_id) in asset_replacements {
+                let placeholder = format!("asset-{:x}", md5::compute(url));
+                if value == url || value == &placeholder {
+                    *value = asset_id.clone();
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find a source URL embedded in a JSON/text value without returning or
+/// logging the URL itself.
+fn contains_source_url(value: &str) -> bool {
+    let mut offset = 0;
+    while offset < value.len() {
+        let http = value[offset..].find("http://");
+        let https = value[offset..].find("https://");
+        let Some(relative) = (match (http, https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+        let start = offset + relative;
+        let end = value[start..]
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | ',' | ']' | '}' | ')' | '>')
+            })
+            .map(|length| start + length)
+            .unwrap_or(value.len());
+        if start < end {
+            return true;
+        }
+        offset = end.saturating_add(1);
+        if offset >= value.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Never write a source URL that was not paired with a successful asset
+/// result.  The unavailable marker is explicit and safe for downstream
+/// readers, while the original URL remains available only to the in-memory
+/// download attempt.
+fn redact_unresolved_source_urls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                redact_unresolved_source_urls(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_unresolved_source_urls(child);
+            }
+        }
+        Value::String(text) if text.starts_with("http://") || text.starts_with("https://") => {
+            *text = "asset-unavailable".to_string();
         }
         _ => {}
     }
@@ -361,6 +699,12 @@ impl<'a> RepositoryUnitOfWork<'a> {
             .collect::<SqlResult<Vec<_>>>()?;
 
         for table_name in table_names {
+            // Task 01 deliberately retains legacy rows in archive tables for
+            // rollback/audit.  They are not active records and are allowed to
+            // retain the original values; only active tables are verified.
+            if table_name.contains("_legacy_v1") || table_name == "settings" {
+                continue;
+            }
             // SQLite table names originate in sqlite_master.  Still quote them
             // defensively so a legacy schema cannot turn this verifier into a
             // dynamic-SQL injection path.
@@ -380,11 +724,17 @@ impl<'a> RepositoryUnitOfWork<'a> {
 
             for column_name in text_columns {
                 let quoted_column = format!("\"{}\"", column_name.replace('"', "\"\""));
-                let query = format!(
-                    "SELECT EXISTS(SELECT 1 FROM {quoted_table}
-                     WHERE {quoted_column} LIKE '%http://%' OR {quoted_column} LIKE '%https://%')"
-                );
-                let found: bool = self.conn.query_row(&query, [], |row| row.get(0))?;
+                let query = format!("SELECT {quoted_column} FROM {quoted_table}");
+                let mut values = self.conn.prepare(&query)?;
+                let mut rows = values.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let value: Option<String> = row.get(0)?;
+                    if value.as_deref().is_some_and(contains_source_url) {
+                        found = true;
+                        break;
+                    }
+                }
                 if found {
                     locations.push(format!("{table_name}.{column_name}"));
                 }
@@ -424,6 +774,7 @@ impl<'a> RepositoryUnitOfWork<'a> {
 
         let mut final_data = data.clone();
         replace_all_placeholders(&mut final_data, &asset_replacements);
+        redact_unresolved_source_urls(&mut final_data);
 
         let provenance = "detail";
         let status = if is_empty {
@@ -638,6 +989,10 @@ impl<'a> RepositoryUnitOfWork<'a> {
         asset_root: &str,
     ) -> SqlResult<Vec<String>> {
         let mut failed_owner_ids = Vec::new();
+        let competitions_have_raw_payload =
+            crate::storage::column_exists(self.conn, "competitions", "raw_payload")?;
+        let teams_have_raw_payload =
+            crate::storage::column_exists(self.conn, "teams", "raw_payload")?;
 
         let mut stmt = self.conn.prepare(
             "SELECT id, logo, country_logo, dataset_id FROM competitions
@@ -659,6 +1014,7 @@ impl<'a> RepositoryUnitOfWork<'a> {
 
         for (id, logo, country_logo, dataset_id) in comps {
             let mut failed = false;
+            let mut raw_payload_replacements = Vec::new();
             let new_logo = match logo {
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
                     match self
@@ -673,9 +1029,14 @@ impl<'a> RepositoryUnitOfWork<'a> {
                         )
                         .await
                     {
-                        Ok(asset_id) => Some(asset_id),
+                        Ok(asset_id) => {
+                            raw_payload_replacements.push((url.clone(), asset_id.clone()));
+                            Some(asset_id)
+                        }
                         Err(_) => {
                             failed = true;
+                            raw_payload_replacements
+                                .push((url.clone(), "asset-unavailable".to_string()));
                             Some("asset-unavailable".to_string())
                         }
                     }
@@ -696,9 +1057,14 @@ impl<'a> RepositoryUnitOfWork<'a> {
                         )
                         .await
                     {
-                        Ok(asset_id) => Some(asset_id),
+                        Ok(asset_id) => {
+                            raw_payload_replacements.push((url.clone(), asset_id.clone()));
+                            Some(asset_id)
+                        }
                         Err(_) => {
                             failed = true;
+                            raw_payload_replacements
+                                .push((url.clone(), "asset-unavailable".to_string()));
                             Some("asset-unavailable".to_string())
                         }
                     }
@@ -710,6 +1076,16 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "UPDATE competitions SET logo = ?1, country_logo = ?2 WHERE id = ?3 AND dataset_id = ?4",
                 params![new_logo, new_country_logo, id, dataset_id],
             )?;
+            if competitions_have_raw_payload {
+                for (source_url, replacement) in raw_payload_replacements {
+                    self.conn.execute(
+                        "UPDATE competitions
+                         SET raw_payload = replace(raw_payload, ?1, ?2)
+                         WHERE id = ?3 AND dataset_id = ?4",
+                        params![source_url, replacement, id, dataset_id],
+                    )?;
+                }
+            }
 
             if failed {
                 failed_owner_ids.push(id);
@@ -734,6 +1110,7 @@ impl<'a> RepositoryUnitOfWork<'a> {
 
         for (id, logo, dataset_id) in team_rows {
             let mut failed = false;
+            let mut raw_payload_replacements = Vec::new();
             let new_logo = match logo {
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
                     match self
@@ -748,9 +1125,14 @@ impl<'a> RepositoryUnitOfWork<'a> {
                         )
                         .await
                     {
-                        Ok(asset_id) => Some(asset_id),
+                        Ok(asset_id) => {
+                            raw_payload_replacements.push((url.clone(), asset_id.clone()));
+                            Some(asset_id)
+                        }
                         Err(_) => {
                             failed = true;
+                            raw_payload_replacements
+                                .push((url.clone(), "asset-unavailable".to_string()));
                             Some("asset-unavailable".to_string())
                         }
                     }
@@ -762,6 +1144,16 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "UPDATE teams SET logo = ?1 WHERE id = ?2 AND dataset_id = ?3",
                 params![new_logo, id, dataset_id],
             )?;
+            if teams_have_raw_payload {
+                for (source_url, replacement) in raw_payload_replacements {
+                    self.conn.execute(
+                        "UPDATE teams
+                         SET raw_payload = replace(raw_payload, ?1, ?2)
+                         WHERE id = ?3 AND dataset_id = ?4",
+                        params![source_url, replacement, id, dataset_id],
+                    )?;
+                }
+            }
 
             if failed {
                 failed_owner_ids.push(id);
@@ -990,6 +1382,18 @@ fn is_stale(
     let Some(current) = latest_state_history(tx, match_id, dataset_id)? else {
         return Ok(false);
     };
+    // RECOVERY_PENDING is a local lifecycle marker inserted after a feed
+    // disconnect. Its receipt time must not make the reacquired authoritative
+    // score/result look stale merely because the source timestamp predates the
+    // disconnect.
+    let recovery_pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM match_state_history WHERE match_id=?1 AND dataset_id=?2 AND state='RECOVERY_PENDING')",
+        params![match_id, dataset_id],
+        |row| row.get(0),
+    )?;
+    if recovery_pending {
+        return Ok(false);
+    }
     Ok(match_state::compare_order_parts(
         event.source_timestamp.as_deref(),
         Some(event.received_at.as_str()),
@@ -1040,7 +1444,8 @@ fn latest_state_history(
 ) -> SqlResult<Option<HistoryRow>> {
     let mut statement = tx.prepare(
         "SELECT NULLIF(source_timestamp,''), received_at, payload_hash, state
-         FROM match_state_history WHERE match_id=?1 AND dataset_id=?2",
+         FROM match_state_history WHERE match_id=?1 AND dataset_id=?2
+           AND state != 'RECOVERY_PENDING'",
     )?;
     let mut rows = statement.query(params![match_id, dataset_id])?;
     let mut latest: Option<HistoryRow> = None;

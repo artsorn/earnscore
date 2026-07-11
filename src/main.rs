@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
@@ -15,6 +15,7 @@ pub mod assets;
 pub mod detail;
 pub mod domain;
 pub mod feed;
+pub mod recovery;
 pub mod storage;
 
 static REQ_ID: AtomicI64 = AtomicI64::new(1000);
@@ -2531,7 +2532,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 params![dataset_id],
             )?;
 
-            let config = feed::FeedSessionConfig::default();
+            let recovery_manager = Arc::new(crate::recovery::RecoveryManager::new(
+                resolved_db_path.clone(),
+                dataset_id.clone(),
+            ));
+            if let Err(error) = recovery_manager.on_startup() {
+                eprintln!("[Recovery] Startup candidate scan failed: {error}");
+            }
+            let recovery_for_hook = recovery_manager.clone();
+            let mut config = feed::FeedSessionConfig::default();
+            config.lifecycle_hook = Some(Arc::new(move |lifecycle| {
+                let result = match lifecycle {
+                    feed::FeedLifecycleEvent::Disconnected {
+                        session_id,
+                        sport_id,
+                    } => recovery_for_hook.on_feed_disconnect(Some(&session_id), Some(sport_id)),
+                    feed::FeedLifecycleEvent::Reconnected { .. } => {
+                        recovery_for_hook.on_feed_reconnect()
+                    }
+                };
+                if let Err(error) = result {
+                    eprintln!("[Recovery] Feed lifecycle hook failed: {error}");
+                }
+            }));
             let browser = std::sync::Arc::new(
                 feed::browser::OwnedBrowser::launch(config.browser.clone())
                     .await
@@ -2604,6 +2627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
             let db_path_clone = resolved_db_path.clone();
+            let recovery_for_loop = recovery_manager.clone();
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(500));
 
@@ -2613,6 +2637,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             break;
                         }
                         _ = ticker.tick() => {
+                            if let Err(error) = recovery_for_loop.dispatch_once() {
+                                eprintln!("[Recovery] Dispatch failed: {error}");
+                            }
                             if let Ok(conn) = Connection::open(&db_path_clone) {
                                 if let Ok(Some(event)) = football.watchdog_tick().await {
                                     let evidence = crate::domain::match_state::AdmissionEvidence {
@@ -2672,6 +2699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
+                let _ = recovery_for_loop.on_feed_disconnect(None, None);
                 let _ = football.shutdown().await;
                 let _ = basketball.shutdown().await;
                 let _ = browser.shutdown().await;
@@ -3089,6 +3117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Semaphore;
 
     fn create_legacy_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

@@ -1,0 +1,9 @@
+{
+  "case": "not-found-grace",
+  "steps": [
+    { "event": "FEED_DISCONNECTED", "match_id": "recovery-missing-1" },
+    { "outcome": "NOT_FOUND", "within_grace": true, "assert": "retry_same_match" },
+    { "outcome": "NOT_FOUND", "within_grace": false, "assert": "state_is_unknown" },
+    { "assert": "no_replacement_match" }
+  ]
+}

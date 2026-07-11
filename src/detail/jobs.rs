@@ -1,6 +1,33 @@
 use rand::Rng;
 use std::time::Duration;
 
+/// Sections that must be refreshed once a previously-live match finishes
+/// while the feed is offline.  `period_scores` is materialized from the
+/// append-only state history by the recovery finalizer.
+pub const FINAL_DETAIL_SECTIONS: &[&str] = &["overview", "odds", "stats", "incidents", "lineups"];
+
+pub const MANUAL_DETAIL_SECTIONS: &[&str] = FINAL_DETAIL_SECTIONS;
+
+pub fn plan_final_sections(
+    conn: &rusqlite::Connection,
+    match_id: &str,
+    dataset_id: &str,
+) -> rusqlite::Result<usize> {
+    crate::recovery::finalizer::Finalizer::plan_required_sections(
+        conn, match_id, dataset_id, "FINAL",
+    )
+}
+
+pub fn plan_manual_sections(
+    conn: &rusqlite::Connection,
+    match_id: &str,
+    dataset_id: &str,
+) -> rusqlite::Result<usize> {
+    crate::recovery::finalizer::Finalizer::plan_required_sections(
+        conn, match_id, dataset_id, "MANUAL",
+    )
+}
+
 /// Calculate the exponential backoff delay with jitter (±15%).
 pub fn calculate_retry_delay(
     attempt_count: i32,

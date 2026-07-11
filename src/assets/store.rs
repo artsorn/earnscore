@@ -50,22 +50,30 @@ pub fn publish_asset_file(
         .create_new(true)
         .open(&tmp_file_path)
         .map_err(|e| format!("Failed to create temporary file: {}", e))?;
-    tmp_file
-        .write_all(bytes)
-        .and_then(|_| tmp_file.sync_all())
-        .map_err(|e| format!("Failed to write temporary file: {}", e))?;
+    if let Err(error) = tmp_file.write_all(bytes).and_then(|_| tmp_file.sync_all()) {
+        let _ = fs::remove_file(&tmp_file_path);
+        return Err(format!("Failed to write temporary file: {}", error));
+    }
 
     // Construct destination path: {asset_root}/{entity_type}/{entity_id}/{hash}.{ext}
     let target_dir = root.join(entity_type).join(entity_id);
-    fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create target dir: {}", e))?;
+    if let Err(error) = fs::create_dir_all(&target_dir) {
+        let _ = fs::remove_file(&tmp_file_path);
+        return Err(format!("Failed to create target dir: {}", error));
+    }
 
     let target_file_path = target_dir.join(format!("{}.{}", hash, ext));
 
     // Never replace a published content-addressed file.  A same-content race
     // is safe to reuse; a different-content collision is corruption.
     if target_file_path.exists() {
-        let existing = fs::read(&target_file_path)
-            .map_err(|e| format!("Failed to read existing asset: {}", e))?;
+        let existing = match fs::read(&target_file_path) {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_file_path);
+                return Err(format!("Failed to read existing asset: {}", error));
+            }
+        };
         let _ = fs::remove_file(&tmp_file_path);
         if calculate_sha256(&existing) == hash && existing == bytes {
             return Ok(target_file_path);
@@ -75,8 +83,13 @@ pub fn publish_asset_file(
 
     if let Err(error) = fs::rename(&tmp_file_path, &target_file_path) {
         if target_file_path.exists() {
-            let existing = fs::read(&target_file_path)
-                .map_err(|e| format!("Failed to read raced asset: {}", e))?;
+            let existing = match fs::read(&target_file_path) {
+                Ok(existing) => existing,
+                Err(read_error) => {
+                    let _ = fs::remove_file(&tmp_file_path);
+                    return Err(format!("Failed to read raced asset: {}", read_error));
+                }
+            };
             let _ = fs::remove_file(&tmp_file_path);
             if calculate_sha256(&existing) == hash && existing == bytes {
                 return Ok(target_file_path);

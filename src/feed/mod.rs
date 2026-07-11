@@ -10,6 +10,7 @@ use crate::domain::{EventType, NormalizedEvent};
 use adapters::{FeedAdapter, FeedError, SourceEnvelope};
 use browser::TargetRole;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use adapters::{BasketballAdapter, FootballAdapter, NormalizedMatch, Readiness};
@@ -25,11 +26,35 @@ pub enum SessionState {
     Stopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FeedSessionConfig {
     pub browser: OwnedBrowserConfig,
     pub heartbeat_interval: Duration,
     pub stale_after: Duration,
+    pub lifecycle_hook: Option<FeedLifecycleHook>,
+}
+
+pub type FeedLifecycleHook = Arc<dyn Fn(FeedLifecycleEvent) + Send + Sync>;
+
+impl std::fmt::Debug for FeedSessionConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FeedSessionConfig")
+            .field("browser", &self.browser)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("stale_after", &self.stale_after)
+            .field(
+                "lifecycle_hook",
+                &self.lifecycle_hook.as_ref().map(|_| "installed"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedLifecycleEvent {
+    Disconnected { session_id: String, sport_id: i32 },
+    Reconnected { session_id: String, sport_id: i32 },
 }
 
 impl Default for FeedSessionConfig {
@@ -38,6 +63,7 @@ impl Default for FeedSessionConfig {
             browser: OwnedBrowserConfig::default(),
             heartbeat_interval: Duration::from_secs(5),
             stale_after: Duration::from_secs(20),
+            lifecycle_hook: None,
         }
     }
 }
@@ -50,6 +76,8 @@ pub struct FeedSession<A: FeedAdapter> {
     seen_live: HashSet<String>,
     seen_events: HashSet<String>,
     last_heartbeat: std::time::Instant,
+    session_id: String,
+    disconnect_notified: bool,
     config: FeedSessionConfig,
 }
 
@@ -68,6 +96,8 @@ impl<A: FeedAdapter> FeedSession<A> {
             seen_live: HashSet::new(),
             seen_events: HashSet::new(),
             last_heartbeat: std::time::Instant::now(),
+            session_id: format!("feed-{}", uuid::Uuid::new_v4()),
+            disconnect_notified: false,
             config,
         }
     }
@@ -97,6 +127,9 @@ impl<A: FeedAdapter> FeedSession<A> {
     pub fn state(&self) -> SessionState {
         self.state
     }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
     pub fn is_stale(&self) -> bool {
         self.last_heartbeat.elapsed() >= self.config.stale_after
     }
@@ -106,6 +139,30 @@ impl<A: FeedAdapter> FeedSession<A> {
         self.state = SessionState::Connected;
         NormalizedEvent::new(
             EventType::FeedHeartbeat,
+            None,
+            Some(self.adapter.sport_id()),
+            None,
+            now(),
+            serde_json::json!({"sport": self.adapter.name()}),
+        )
+    }
+
+    /// Mark a transport disconnect exactly once.  Parser/source-contract
+    /// failures intentionally do not call this method and therefore cannot
+    /// turn a malformed payload into a match-finished signal.
+    pub fn mark_disconnected(&mut self) -> NormalizedEvent {
+        self.state = SessionState::Disconnected;
+        if !self.disconnect_notified {
+            self.disconnect_notified = true;
+            if let Some(hook) = &self.config.lifecycle_hook {
+                hook(FeedLifecycleEvent::Disconnected {
+                    session_id: self.session_id.clone(),
+                    sport_id: self.adapter.sport_id(),
+                });
+            }
+        }
+        NormalizedEvent::new(
+            EventType::FeedDisconnected,
             None,
             Some(self.adapter.sport_id()),
             None,
@@ -173,11 +230,13 @@ impl<A: FeedAdapter> FeedSession<A> {
     /// event loop; no external heartbeat bookkeeping is required.
     pub async fn watchdog_tick(&mut self) -> Result<Option<NormalizedEvent>, FeedError> {
         if !matches!(self.browser.health().await, BrowserHealth::Healthy) {
+            self.mark_disconnected();
             self.reconnect().await?;
             return Ok(Some(self.heartbeat()));
         }
         if self.last_heartbeat.elapsed() >= self.config.stale_after {
             self.state = SessionState::Stale;
+            self.mark_disconnected();
             self.reconnect().await?;
             return Ok(Some(self.heartbeat()));
         }
@@ -196,6 +255,15 @@ impl<A: FeedAdapter> FeedSession<A> {
             .map_err(|error| FeedError::Browser(error.to_string()))?;
         self.state = SessionState::Connected;
         self.last_heartbeat = std::time::Instant::now();
+        if self.disconnect_notified {
+            self.disconnect_notified = false;
+            if let Some(hook) = &self.config.lifecycle_hook {
+                hook(FeedLifecycleEvent::Reconnected {
+                    session_id: self.session_id.clone(),
+                    sport_id: self.adapter.sport_id(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -211,7 +279,10 @@ impl<A: FeedAdapter> FeedSession<A> {
             }
             match cdp.capture_fallbacks().await {
                 Ok(fallbacks) => sources.extend(fallbacks),
-                Err(_) if sources.is_empty() => return Err(FeedError::Disconnected),
+                Err(_) if sources.is_empty() => {
+                    self.mark_disconnected();
+                    return Err(FeedError::Disconnected);
+                }
                 Err(_) => {}
             }
             true
@@ -219,6 +290,7 @@ impl<A: FeedAdapter> FeedSession<A> {
             false
         };
         if !connected {
+            self.mark_disconnected();
             return Err(FeedError::Disconnected);
         }
         if sources.is_empty() {

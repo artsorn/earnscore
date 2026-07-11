@@ -1,0 +1,15 @@
+{
+  "case": "finished-while-offline",
+  "steps": [
+    { "event": "FEED_DISCONNECTED", "match_id": "recovery-finished-1" },
+    { "state": "RECOVERY_PENDING" },
+    {
+      "event": "MATCH_FINISHED",
+      "match_id": "recovery-finished-1",
+      "payload": { "home_scores": [2], "away_scores": [1], "status": "FINISHED" },
+      "evidence": { "source_status": "FINISHED" }
+    },
+    { "plan": ["overview", "odds", "stats", "incidents", "lineups", "period_scores"] },
+    { "assert": "one_successful_final_version" }
+  ]
+}

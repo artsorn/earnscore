@@ -1,0 +1,14 @@
+{
+  "case": "still-live-after-reconnect",
+  "steps": [
+    { "event": "FEED_DISCONNECTED", "match_id": "recovery-live-1" },
+    { "state": "RECOVERY_PENDING" },
+    {
+      "event": "MATCH_SCORE_CHANGED",
+      "match_id": "recovery-live-1",
+      "payload": { "home_scores": [1], "away_scores": [0], "period": "2H", "clock": "61:00" },
+      "evidence": { "source_status": "LIVE", "started": true, "period": "2H", "clock": "61:00" }
+    },
+    { "assert": "state_is_live_and_completed_sections_are_not_reloaded" }
+  ]
+}

@@ -1,7 +1,7 @@
 # Task 06: Feed Recovery and Versioned Finalization
 
 ## Status
-
+Passed
 Pending
 
 ## Outcome
@@ -106,4 +106,3 @@ Feed disconnect/restart marks only unresolved previously-Live Matches for recove
 - src/storage/repositories.rs — existing durable repository boundary
 - tests/fixtures/football-finished.json
 - tests/fixtures/basketball-finished.json
-
