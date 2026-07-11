@@ -1,5 +1,5 @@
-use std::time::Duration;
 use reqwest::Client;
+use std::time::Duration;
 
 /// The result of a successful bounded asset download.
 pub struct DownloadedAsset {
@@ -44,7 +44,8 @@ pub fn validate_image_bytes(bytes: &[u8], mime_type: &str) -> Result<(), String>
             }
         }
         "image/svg+xml" => {
-            let s = std::str::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8 for SVG: {}", e))?;
+            let s =
+                std::str::from_utf8(bytes).map_err(|e| format!("Invalid UTF-8 for SVG: {}", e))?;
             if s.contains("<svg") {
                 Ok(())
             } else {
@@ -64,14 +65,18 @@ pub async fn download_asset(
     max_retries: u32,
     retry_delay: Duration,
 ) -> Result<DownloadedAsset, String> {
+    let attempts = max_retries.saturating_add(1);
     let mut attempt = 0;
     loop {
         attempt += 1;
         match download_asset_once(client, url, max_size_bytes, timeout).await {
             Ok(asset) => return Ok(asset),
             Err(e) => {
-                if attempt >= max_retries {
-                    return Err(format!("Failed after {} attempts. Last error: {}", attempt, e));
+                if attempt >= attempts {
+                    return Err(format!(
+                        "Failed after {} attempts. Last error: {}",
+                        attempt, e
+                    ));
                 }
                 tokio::time::sleep(retry_delay).await;
             }
@@ -112,7 +117,10 @@ async fn download_asset_once(
 
     if let Some(len) = res.content_length() {
         if len > max_size_bytes as u64 {
-            return Err(format!("Content-Length {} exceeds limit {}", len, max_size_bytes));
+            return Err(format!(
+                "Content-Length {} exceeds limit {}",
+                len, max_size_bytes
+            ));
         }
     }
 
@@ -124,7 +132,10 @@ async fn download_asset_once(
         .map_err(|e| format!("Error reading body chunk: {}", e))?
     {
         if bytes.len() + chunk.len() > max_size_bytes {
-            return Err(format!("Response body size exceeded maximum limit of {}", max_size_bytes));
+            return Err(format!(
+                "Response body size exceeded maximum limit of {}",
+                max_size_bytes
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -133,7 +144,8 @@ async fn download_asset_once(
 
     let (width, height) = match imagesize::blob_size(&bytes) {
         Ok(size) => (Some(size.width as i32), Some(size.height as i32)),
-        Err(_) => (None, None),
+        Err(_error) if mime_type == "image/svg+xml" => (None, None),
+        Err(error) => return Err(format!("Malformed {} image: {}", mime_type, error)),
     };
 
     Ok(DownloadedAsset {

@@ -154,11 +154,26 @@ pub fn extract_section_data(
                 "name": full_payload["name"].as_str().unwrap_or(""),
             })
         }
-        DetailSection::Odds => full_payload.get("odds").cloned().unwrap_or_else(|| serde_json::json!({})),
-        DetailSection::H2H => full_payload.get("h2h").cloned().unwrap_or_else(|| serde_json::json!({})),
-        DetailSection::Lineups => full_payload.get("lineups").cloned().unwrap_or_else(|| serde_json::json!({})),
-        DetailSection::Stats => full_payload.get("stats").cloned().unwrap_or_else(|| serde_json::json!({})),
-        DetailSection::Incidents => full_payload.get("incidents").cloned().unwrap_or_else(|| serde_json::json!([])),
+        DetailSection::Odds => full_payload
+            .get("odds")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        DetailSection::H2H => full_payload
+            .get("h2h")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        DetailSection::Lineups => full_payload
+            .get("lineups")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        DetailSection::Stats => full_payload
+            .get("stats")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        DetailSection::Incidents => full_payload
+            .get("incidents")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
     };
 
     let mut candidates = Vec::new();
@@ -182,12 +197,21 @@ pub fn is_section_empty(section: DetailSection, val: &Value) -> bool {
             }
             match section {
                 DetailSection::Lineups => {
-                    let home_empty = map.get("home").map(|v| v.as_array().map_or(true, |a| a.is_empty())).unwrap_or(true);
-                    let away_empty = map.get("away").map(|v| v.as_array().map_or(true, |a| a.is_empty())).unwrap_or(true);
+                    let home_empty = map
+                        .get("home")
+                        .map(|v| v.as_array().map_or(true, |a| a.is_empty()))
+                        .unwrap_or(true);
+                    let away_empty = map
+                        .get("away")
+                        .map(|v| v.as_array().map_or(true, |a| a.is_empty()))
+                        .unwrap_or(true);
                     home_empty && away_empty
                 }
                 DetailSection::H2H => {
-                    let history_empty = map.get("history").map(|v| v.as_array().map_or(true, |a| a.is_empty())).unwrap_or(true);
+                    let history_empty = map
+                        .get("history")
+                        .map(|v| v.as_array().map_or(true, |a| a.is_empty()))
+                        .unwrap_or(true);
                     history_empty
                 }
                 _ => false,
@@ -198,7 +222,11 @@ pub fn is_section_empty(section: DetailSection, val: &Value) -> bool {
     }
 }
 
-fn sanitize_and_extract_images(val: &mut Value, candidates: &mut Vec<ImageCandidate>, section_name: &str) {
+fn sanitize_and_extract_images(
+    val: &mut Value,
+    candidates: &mut Vec<ImageCandidate>,
+    section_name: &str,
+) {
     match val {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();

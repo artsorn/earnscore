@@ -104,10 +104,22 @@ pub struct DetailJob {
 /// An image URL candidate extracted from the detail payload.
 /// Note that it explicitly DOES NOT implement serde::Serialize to prevent
 /// database, jobs, outbox, or log serialization.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ImageCandidate {
     pub url: String,
     pub entity_type: String,
     pub entity_id: String,
     pub role: String,
+}
+
+impl std::fmt::Debug for ImageCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImageCandidate")
+            .field("url", &"[redacted]")
+            .field("entity_type", &self.entity_type)
+            .field("entity_id", &self.entity_id)
+            .field("role", &self.role)
+            .finish()
+    }
 }

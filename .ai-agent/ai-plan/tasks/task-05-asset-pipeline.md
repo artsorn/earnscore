@@ -1,7 +1,7 @@
 # Task 05: Ephemeral Asset Pipeline and Local Storage
 
 ## Status
-Pending
+Passed
 
 ## Outcome
 

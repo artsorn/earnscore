@@ -2,12 +2,11 @@ pub mod download;
 pub mod store;
 pub mod types;
 
+use crate::detail::types::ImageCandidate;
+use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tokio::time::sleep;
-use reqwest::Client;
-use crate::detail::types::ImageCandidate;
 
 #[derive(Clone)]
 pub struct AssetWorkerConfig {
@@ -39,11 +38,12 @@ pub struct AssetCoordinator {
     pub config: AssetWorkerConfig,
     client: Client,
     semaphore: Arc<Semaphore>,
+    request_gate: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AssetCoordinator {
     pub fn new(db_path: String, config: AssetWorkerConfig) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit.max(1)));
         Self {
             db_path,
             config,
@@ -52,23 +52,23 @@ impl AssetCoordinator {
                 .build()
                 .unwrap_or_default(),
             semaphore,
+            request_gate: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     /// Process a batch of image candidates for a detail section.
     /// Downloads them concurrently using the semaphore, obeying delay settings,
-    /// and returns the download results mapped by their URL.
+    /// and returns the download results keyed by candidate index.
     pub async fn process_candidates(
         &self,
         candidates: &[ImageCandidate],
-    ) -> std::collections::HashMap<String, Result<download::DownloadedAsset, String>> {
-        let mut results = std::collections::HashMap::new();
+    ) -> std::collections::HashMap<usize, Result<download::DownloadedAsset, String>> {
         if candidates.is_empty() {
-            return results;
+            return std::collections::HashMap::new();
         }
 
         let mut tasks = tokio::task::JoinSet::new();
-        for candidate in candidates {
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
             let client = self.client.clone();
             let url = candidate.url.clone();
             let max_size = self.config.max_size_bytes;
@@ -77,24 +77,39 @@ impl AssetCoordinator {
             let retry_delay = self.config.retry_delay;
             let download_delay = self.config.download_delay;
             let sem = self.semaphore.clone();
+            let request_gate = self.request_gate.clone();
 
             tasks.spawn(async move {
                 // Enforce download concurrency limit via semaphore
                 let _permit = sem.acquire().await.ok();
-                
-                // Enforce configured delay between requests
-                if !download_delay.is_zero() {
-                    sleep(download_delay).await;
-                }
 
-                let res = download::download_asset(&client, &url, max_size, timeout, max_retries, retry_delay).await;
-                (url, res)
+                // Space request starts globally while still allowing bounded
+                // request concurrency.
+                let mut last_request = request_gate.lock().await;
+                if let Some(previous) = *last_request {
+                    let next = previous + download_delay;
+                    tokio::time::sleep_until(next.into()).await;
+                }
+                *last_request = Some(std::time::Instant::now());
+                drop(last_request);
+
+                let res = download::download_asset(
+                    &client,
+                    &url,
+                    max_size,
+                    timeout,
+                    max_retries,
+                    retry_delay,
+                )
+                .await;
+                (candidate_index, res)
             });
         }
 
+        let mut results = std::collections::HashMap::with_capacity(candidates.len());
         while let Some(res) = tasks.join_next().await {
-            if let Ok((url, download_res)) = res {
-                results.insert(url, download_res);
+            if let Ok((candidate_index, download_res)) = res {
+                results.insert(candidate_index, download_res);
             }
         }
 

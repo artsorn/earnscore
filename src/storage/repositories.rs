@@ -3,6 +3,7 @@ use crate::domain::match_state::{self, AdmissionEvidence, AdmissionResult, Inter
 use crate::domain::odds::OddsQuote;
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Transaction, params};
 use serde_json::{Value, json};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationOutcome {
@@ -144,9 +145,10 @@ impl<'a> RepositoryUnitOfWork<'a> {
         lease_duration_secs: i64,
     ) -> SqlResult<Option<crate::detail::types::DetailJob>> {
         let tx = self.conn.unchecked_transaction()?;
-        
-        let candidate: Option<(i64, String, String, String, String, i32)> = tx.query_row(
-            "SELECT id, match_id, dataset_id, section_name, load_phase, attempt_count
+
+        let candidate: Option<(i64, String, String, String, String, i32)> = tx
+            .query_row(
+                "SELECT id, match_id, dataset_id, section_name, load_phase, attempt_count
              FROM detail_jobs
              WHERE (status = 'PENDING' OR status = 'FAILED_RETRYABLE')
                AND datetime(scheduled_at) <= datetime('now')
@@ -159,11 +161,22 @@ impl<'a> RepositoryUnitOfWork<'a> {
                )
              ORDER BY scheduled_at ASC, id ASC
              LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        ).optional()?;
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
 
-        if let Some((id, match_id, dataset_id, section_name, load_phase, attempt_count)) = candidate {
+        if let Some((id, match_id, dataset_id, section_name, load_phase, attempt_count)) = candidate
+        {
             let expires = format!("+{} seconds", lease_duration_secs);
             tx.execute(
                 "UPDATE detail_jobs
@@ -191,36 +204,195 @@ impl<'a> RepositoryUnitOfWork<'a> {
     }
 }
 
-fn replace_all_placeholders(val: &mut Value, url_to_asset_id: &std::collections::HashMap<String, String>) {
+fn replace_all_placeholders(val: &mut Value, asset_replacements: &[(String, String)]) {
     match val {
         Value::Object(map) => {
             for (_, v) in map.iter_mut() {
                 if let Some(s) = v.as_str() {
-                    if s.starts_with("asset-") {
-                        for (url, asset_id) in url_to_asset_id {
-                            let url_hash = format!("{:x}", md5::compute(url));
-                            let placeholder = format!("asset-{}", url_hash);
-                            if s == placeholder {
-                                *v = Value::String(asset_id.clone());
-                                break;
-                            }
+                    for (url, asset_id) in asset_replacements {
+                        let placeholder = format!("asset-{:x}", md5::compute(url));
+                        if s == url || s == placeholder {
+                            *v = Value::String(asset_id.clone());
+                            break;
                         }
                     }
                 } else {
-                    replace_all_placeholders(v, url_to_asset_id);
+                    replace_all_placeholders(v, asset_replacements);
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                replace_all_placeholders(item, url_to_asset_id);
+                replace_all_placeholders(item, asset_replacements);
             }
         }
         _ => {}
     }
 }
 
+fn storage_error(error: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+}
+
+fn persist_downloaded_asset(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    candidate: &crate::detail::types::ImageCandidate,
+    downloaded: &crate::assets::download::DownloadedAsset,
+    asset_root: &str,
+) -> SqlResult<String> {
+    let content_hash = crate::assets::store::calculate_sha256(&downloaded.bytes);
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT asset_id, storage_key FROM assets WHERE content_hash = ?1",
+            params![content_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    let asset_id = if let Some((asset_id, storage_key)) = existing {
+        let path = Path::new(asset_root).join(&storage_key);
+        if !path.is_file() {
+            return Err(storage_error(format!(
+                "Published asset is missing: {}",
+                path.display()
+            )));
+        }
+        let existing_bytes = std::fs::read(&path).map_err(|error| {
+            storage_error(format!(
+                "Cannot read existing asset {}: {}",
+                asset_id, error
+            ))
+        })?;
+        if crate::assets::store::calculate_sha256(&existing_bytes) != content_hash {
+            return Err(storage_error(format!(
+                "Existing asset {} failed content-hash verification",
+                asset_id
+            )));
+        }
+        asset_id
+    } else {
+        let ext = crate::assets::store::mime_to_extension(&downloaded.mime_type);
+        crate::assets::store::publish_asset_file(
+            asset_root,
+            &candidate.entity_type,
+            &candidate.entity_id,
+            &content_hash,
+            ext,
+            &downloaded.bytes,
+        )
+        .map_err(storage_error)?;
+
+        let asset_id = format!("asset-{}", content_hash);
+        let storage_key = format!(
+            "{}/{}/{}.{}",
+            candidate.entity_type, candidate.entity_id, content_hash, ext
+        );
+        tx.execute(
+            "INSERT INTO assets (asset_id, content_hash, storage_key, mime_type, byte_size, width, height, status, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'READY', 'local')",
+            params![
+                asset_id,
+                content_hash,
+                storage_key,
+                downloaded.mime_type,
+                downloaded.bytes.len() as i64,
+                downloaded.width,
+                downloaded.height,
+            ],
+        )?;
+
+        let has_outbox: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_outbox')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_outbox {
+            let payload = json!({
+                "asset_id": asset_id,
+                "content_hash": content_hash,
+                "storage_key": storage_key,
+                "mime_type": downloaded.mime_type,
+                "byte_size": downloaded.bytes.len() as i64,
+                "width": downloaded.width,
+                "height": downloaded.height,
+            });
+            tx.execute(
+                "INSERT OR IGNORE INTO sync_outbox (dataset_id, entity_type, entity_id, event_type, payload_json)
+                 VALUES (?1, 'asset', ?2, 'ASSET_UPLOAD_INTENT', ?3)",
+                params![dataset_id, asset_id, payload.to_string()],
+            )?;
+        }
+        asset_id
+    };
+
+    tx.execute(
+        "INSERT OR IGNORE INTO asset_jobs (asset_id, dataset_id, status, completed_at)
+         VALUES (?1, ?2, 'COMPLETED', datetime('now'))",
+        params![asset_id, dataset_id],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO asset_links (asset_id, dataset_id, entity_type, entity_id, role)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            asset_id,
+            dataset_id,
+            candidate.entity_type,
+            candidate.entity_id,
+            candidate.role
+        ],
+    )?;
+    Ok(asset_id)
+}
+
 impl<'a> RepositoryUnitOfWork<'a> {
+    /// Return persisted source-URL locations without ever returning the URL
+    /// itself.  This is intended for migration verification and tests after
+    /// asset conversion; callers can safely report the returned locations.
+    pub fn find_persisted_source_url_locations(&self) -> SqlResult<Vec<String>> {
+        let mut locations = Vec::new();
+        let mut tables = self.conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )?;
+        let table_names = tables
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        for table_name in table_names {
+            // SQLite table names originate in sqlite_master.  Still quote them
+            // defensively so a legacy schema cannot turn this verifier into a
+            // dynamic-SQL injection path.
+            let quoted_table = format!("\"{}\"", table_name.replace('"', "\"\""));
+            let pragma = format!("PRAGMA table_info({quoted_table})");
+            let mut columns = self.conn.prepare(&pragma)?;
+            let column_definitions = columns
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .collect::<SqlResult<Vec<_>>>()?;
+            let text_columns = column_definitions
+                .into_iter()
+                .filter(|(_, declared_type)| declared_type.to_ascii_uppercase().contains("TEXT"))
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>();
+
+            for column_name in text_columns {
+                let quoted_column = format!("\"{}\"", column_name.replace('"', "\"\""));
+                let query = format!(
+                    "SELECT EXISTS(SELECT 1 FROM {quoted_table}
+                     WHERE {quoted_column} LIKE '%http://%' OR {quoted_column} LIKE '%https://%')"
+                );
+                let found: bool = self.conn.query_row(&query, [], |row| row.get(0))?;
+                if found {
+                    locations.push(format!("{table_name}.{column_name}"));
+                }
+            }
+        }
+        Ok(locations)
+    }
+
     pub fn save_detail_section_with_assets(
         &self,
         match_id: &str,
@@ -231,100 +403,34 @@ impl<'a> RepositoryUnitOfWork<'a> {
         content_hash: &str,
         source_timestamp: Option<&str>,
         candidates: &[crate::detail::types::ImageCandidate],
-        downloaded_results: &std::collections::HashMap<String, Result<crate::assets::download::DownloadedAsset, String>>,
+        downloaded_results: &std::collections::HashMap<
+            usize,
+            Result<crate::assets::download::DownloadedAsset, String>,
+        >,
         asset_root: &str,
     ) -> SqlResult<()> {
         let tx = self.conn.unchecked_transaction()?;
-        let mut url_to_asset_id = std::collections::HashMap::new();
+        let mut asset_replacements = Vec::with_capacity(candidates.len());
 
-        for candidate in candidates {
-            if let Some(res) = downloaded_results.get(&candidate.url) {
-                match res {
-                    Ok(downloaded) => {
-                        let content_hash = crate::assets::store::calculate_sha256(&downloaded.bytes);
-                        
-                        let existing_asset_id: Option<String> = tx.query_row(
-                            "SELECT asset_id FROM assets WHERE content_hash = ?1",
-                            params![content_hash],
-                            |r| r.get(0),
-                        ).optional()?;
-
-                        let asset_id = if let Some(id) = existing_asset_id {
-                            id
-                        } else {
-                            let id = format!("asset-{}", uuid::Uuid::new_v4());
-                            let ext = crate::assets::store::mime_to_extension(&downloaded.mime_type);
-                            let storage_key = format!("{}/{}/{}.{}", candidate.entity_type, candidate.entity_id, content_hash, ext);
-
-                            let _ = crate::assets::store::publish_asset_file(
-                                asset_root,
-                                &candidate.entity_type,
-                                &candidate.entity_id,
-                                &content_hash,
-                                ext,
-                                &downloaded.bytes,
-                            ).map_err(|e| rusqlite::Error::ToSqlConversionFailure(
-                                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)),
-                            ))?;
-
-                            tx.execute(
-                                "INSERT INTO assets (asset_id, content_hash, storage_key, mime_type, byte_size, width, height, status, provenance)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'READY', 'local')",
-                                params![
-                                    id,
-                                    content_hash,
-                                    storage_key,
-                                    downloaded.mime_type,
-                                    downloaded.bytes.len() as i64,
-                                    downloaded.width,
-                                    downloaded.height,
-                                ],
-                            )?;
-
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_jobs (asset_id, dataset_id, status, completed_at)
-                                 VALUES (?1, ?2, 'COMPLETED', datetime('now'))",
-                                params![id, dataset_id],
-                            )?;
-
-                            let payload = json!({
-                                "asset_id": id,
-                                "content_hash": content_hash,
-                                "storage_key": storage_key,
-                                "mime_type": downloaded.mime_type,
-                                "byte_size": downloaded.bytes.len() as i64,
-                                "width": downloaded.width,
-                                "height": downloaded.height,
-                            });
-                            tx.execute(
-                                "INSERT OR IGNORE INTO sync_outbox (dataset_id, entity_type, entity_id, event_type, payload_json)
-                                 VALUES (?1, 'asset', ?2, 'ASSET_UPLOAD_INTENT', ?3)",
-                                params![dataset_id, id, payload.to_string()],
-                            )?;
-
-                            id
-                        };
-
-                        tx.execute(
-                            "INSERT OR IGNORE INTO asset_links (asset_id, dataset_id, entity_type, entity_id, role)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![asset_id, dataset_id, candidate.entity_type, candidate.entity_id, candidate.role],
-                        )?;
-
-                        url_to_asset_id.insert(candidate.url.clone(), asset_id);
-                    }
-                    Err(_) => {
-                        url_to_asset_id.insert(candidate.url.clone(), "asset-unavailable".to_string());
-                    }
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            let asset_id = match downloaded_results.get(&candidate_index) {
+                Some(Ok(downloaded)) => {
+                    persist_downloaded_asset(&tx, dataset_id, candidate, downloaded, asset_root)?
                 }
-            }
+                Some(Err(_)) | None => "asset-unavailable".to_string(),
+            };
+            asset_replacements.push((candidate.url.clone(), asset_id));
         }
 
         let mut final_data = data.clone();
-        replace_all_placeholders(&mut final_data, &url_to_asset_id);
+        replace_all_placeholders(&mut final_data, &asset_replacements);
 
         let provenance = "detail";
-        let status = if is_empty { "EMPTY_CONFIRMED" } else { "COMPLETED" };
+        let status = if is_empty {
+            "EMPTY_CONFIRMED"
+        } else {
+            "COMPLETED"
+        };
         let is_empty_val = if is_empty { 1 } else { 0 };
 
         tx.execute(
@@ -387,7 +493,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "lineups" => {
                     if let Some(home_lineup) = final_data["home"].as_array() {
                         for player in home_lineup {
-                            let player_id = player["id"].as_str().or_else(|| player["playerId"].as_str()).unwrap_or("").to_string();
+                            let player_id = player["id"]
+                                .as_str()
+                                .or_else(|| player["playerId"].as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if !player_id.is_empty() {
                                 tx.execute(
                                     "INSERT INTO match_lineups (match_id, dataset_id, team_side, player_id, coach_id, position, shirt_number, starter, lineup_json, source_timestamp, provenance)
@@ -408,7 +518,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
                     }
                     if let Some(away_lineup) = final_data["away"].as_array() {
                         for player in away_lineup {
-                            let player_id = player["id"].as_str().or_else(|| player["playerId"].as_str()).unwrap_or("").to_string();
+                            let player_id = player["id"]
+                                .as_str()
+                                .or_else(|| player["playerId"].as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if !player_id.is_empty() {
                                 tx.execute(
                                     "INSERT INTO match_lineups (match_id, dataset_id, team_side, player_id, coach_id, position, shirt_number, starter, lineup_json, source_timestamp, provenance)
@@ -444,7 +558,9 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "h2h" => {
                     if let Some(history) = final_data["history"].as_array() {
                         for (idx, item) in history.iter().enumerate() {
-                            let ref_key = item["id"].as_str().map(String::from)
+                            let ref_key = item["id"]
+                                .as_str()
+                                .map(String::from)
                                 .unwrap_or_else(|| format!("h2h-{}", idx));
                             let item_str = item.to_string();
                             let h2h_hash = format!("{:x}", md5::compute(&item_str));
@@ -477,12 +593,56 @@ impl<'a> RepositoryUnitOfWork<'a> {
         client: &reqwest::Client,
         asset_root: &str,
     ) -> SqlResult<Vec<String>> {
+        self.convert_legacy_logos_safe(client, asset_root).await
+    }
+
+    async fn import_legacy_asset(
+        &self,
+        client: &reqwest::Client,
+        asset_root: &str,
+        dataset_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+        role: &str,
+        url: &str,
+    ) -> Result<String, String> {
+        let downloaded = crate::assets::download::download_asset(
+            client,
+            url,
+            10 * 1024 * 1024,
+            std::time::Duration::from_secs(10),
+            3,
+            std::time::Duration::from_secs(1),
+        )
+        .await?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let candidate = crate::detail::types::ImageCandidate {
+            url: url.to_string(),
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            role: role.to_string(),
+        };
+        let asset_id =
+            persist_downloaded_asset(&tx, dataset_id, &candidate, &downloaded, asset_root)
+                .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(asset_id)
+    }
+
+    async fn convert_legacy_logos_safe(
+        &self,
+        client: &reqwest::Client,
+        asset_root: &str,
+    ) -> SqlResult<Vec<String>> {
         let mut failed_owner_ids = Vec::new();
 
         let mut stmt = self.conn.prepare(
             "SELECT id, logo, country_logo, dataset_id FROM competitions
              WHERE logo LIKE 'http://%' OR logo LIKE 'https://%'
-                OR country_logo LIKE 'http://%' OR country_logo LIKE 'https://%'"
+                OR country_logo LIKE 'http://%' OR country_logo LIKE 'https://%'",
         )?;
         let mut rows = stmt.query([])?;
         let mut comps = Vec::new();
@@ -498,99 +658,52 @@ impl<'a> RepositoryUnitOfWork<'a> {
         drop(stmt);
 
         for (id, logo, country_logo, dataset_id) in comps {
-            let mut logo_failed = false;
-            let mut country_logo_failed = false;
-
-            let new_logo = if let Some(url) = logo {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    match crate::assets::download::download_asset(
-                        client, &url, 10 * 1024 * 1024, std::time::Duration::from_secs(10), 3, std::time::Duration::from_secs(1)
-                    ).await {
-                        Ok(downloaded) => {
-                            let content_hash = crate::assets::store::calculate_sha256(&downloaded.bytes);
-                            let ext = crate::assets::store::mime_to_extension(&downloaded.mime_type);
-                            let storage_key = format!("competition/{}/{}.{}", id, content_hash, ext);
-                            let asset_id = format!("asset-{}", uuid::Uuid::new_v4());
-                            
-                            let _ = crate::assets::store::publish_asset_file(
-                                asset_root, "competition", &id, &content_hash, ext, &downloaded.bytes
-                            );
-
-                            let tx = self.conn.unchecked_transaction()?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO assets (asset_id, content_hash, storage_key, mime_type, byte_size, width, height, status, provenance)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'READY', 'local')",
-                                params![asset_id, content_hash, storage_key, downloaded.mime_type, downloaded.bytes.len() as i64, downloaded.width, downloaded.height],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_links (asset_id, dataset_id, entity_type, entity_id, role)
-                                 VALUES (?1, ?2, 'competition', ?3, 'logo')",
-                                params![asset_id, dataset_id, id],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_jobs (asset_id, dataset_id, status, completed_at)
-                                 VALUES (?1, ?2, 'COMPLETED', datetime('now'))",
-                                params![asset_id, dataset_id],
-                            )?;
-                            tx.commit()?;
-                            Some(asset_id)
-                        }
+            let mut failed = false;
+            let new_logo = match logo {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    match self
+                        .import_legacy_asset(
+                            client,
+                            asset_root,
+                            &dataset_id,
+                            "competition",
+                            &id,
+                            "logo",
+                            &url,
+                        )
+                        .await
+                    {
+                        Ok(asset_id) => Some(asset_id),
                         Err(_) => {
-                            logo_failed = true;
+                            failed = true;
                             Some("asset-unavailable".to_string())
                         }
                     }
-                } else {
-                    Some(url)
                 }
-            } else {
-                None
+                other => other,
             };
-
-            let new_country_logo = if let Some(url) = country_logo {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    match crate::assets::download::download_asset(
-                        client, &url, 10 * 1024 * 1024, std::time::Duration::from_secs(10), 3, std::time::Duration::from_secs(1)
-                    ).await {
-                        Ok(downloaded) => {
-                            let content_hash = crate::assets::store::calculate_sha256(&downloaded.bytes);
-                            let ext = crate::assets::store::mime_to_extension(&downloaded.mime_type);
-                            let storage_key = format!("competition_country/{}/{}.{}", id, content_hash, ext);
-                            let asset_id = format!("asset-{}", uuid::Uuid::new_v4());
-                            
-                            let _ = crate::assets::store::publish_asset_file(
-                                asset_root, "competition_country", &id, &content_hash, ext, &downloaded.bytes
-                            );
-
-                            let tx = self.conn.unchecked_transaction()?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO assets (asset_id, content_hash, storage_key, mime_type, byte_size, width, height, status, provenance)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'READY', 'local')",
-                                params![asset_id, content_hash, storage_key, downloaded.mime_type, downloaded.bytes.len() as i64, downloaded.width, downloaded.height],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_links (asset_id, dataset_id, entity_type, entity_id, role)
-                                 VALUES (?1, ?2, 'competition', ?3, 'country_logo')",
-                                params![asset_id, dataset_id, id],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_jobs (asset_id, dataset_id, status, completed_at)
-                                 VALUES (?1, ?2, 'COMPLETED', datetime('now'))",
-                                params![asset_id, dataset_id],
-                            )?;
-                            tx.commit()?;
-                            Some(asset_id)
-                        }
+            let new_country_logo = match country_logo {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    match self
+                        .import_legacy_asset(
+                            client,
+                            asset_root,
+                            &dataset_id,
+                            "competition",
+                            &id,
+                            "country_logo",
+                            &url,
+                        )
+                        .await
+                    {
+                        Ok(asset_id) => Some(asset_id),
                         Err(_) => {
-                            country_logo_failed = true;
+                            failed = true;
                             Some("asset-unavailable".to_string())
                         }
                     }
-                } else {
-                    Some(url)
                 }
-            } else {
-                None
+                other => other,
             };
 
             self.conn.execute(
@@ -598,14 +711,14 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 params![new_logo, new_country_logo, id, dataset_id],
             )?;
 
-            if logo_failed || country_logo_failed {
+            if failed {
                 failed_owner_ids.push(id);
             }
         }
 
         let mut stmt = self.conn.prepare(
             "SELECT id, logo, dataset_id FROM teams
-             WHERE logo LIKE 'http://%' OR logo LIKE 'https://%'"
+             WHERE logo LIKE 'http://%' OR logo LIKE 'https://%'",
         )?;
         let mut rows = stmt.query([])?;
         let mut team_rows = Vec::new();
@@ -620,52 +733,29 @@ impl<'a> RepositoryUnitOfWork<'a> {
         drop(stmt);
 
         for (id, logo, dataset_id) in team_rows {
-            let mut logo_failed = false;
-
-            let new_logo = if let Some(url) = logo {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    match crate::assets::download::download_asset(
-                        client, &url, 10 * 1024 * 1024, std::time::Duration::from_secs(10), 3, std::time::Duration::from_secs(1)
-                    ).await {
-                        Ok(downloaded) => {
-                            let content_hash = crate::assets::store::calculate_sha256(&downloaded.bytes);
-                            let ext = crate::assets::store::mime_to_extension(&downloaded.mime_type);
-                            let storage_key = format!("team/{}/{}.{}", id, content_hash, ext);
-                            let asset_id = format!("asset-{}", uuid::Uuid::new_v4());
-                            
-                            let _ = crate::assets::store::publish_asset_file(
-                                asset_root, "team", &id, &content_hash, ext, &downloaded.bytes
-                            );
-
-                            let tx = self.conn.unchecked_transaction()?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO assets (asset_id, content_hash, storage_key, mime_type, byte_size, width, height, status, provenance)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'READY', 'local')",
-                                params![asset_id, content_hash, storage_key, downloaded.mime_type, downloaded.bytes.len() as i64, downloaded.width, downloaded.height],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_links (asset_id, dataset_id, entity_type, entity_id, role)
-                                 VALUES (?1, ?2, 'team', ?3, 'logo')",
-                                params![asset_id, dataset_id, id],
-                            )?;
-                            tx.execute(
-                                "INSERT OR IGNORE INTO asset_jobs (asset_id, dataset_id, status, completed_at)
-                                 VALUES (?1, ?2, 'COMPLETED', datetime('now'))",
-                                params![asset_id, dataset_id],
-                            )?;
-                            tx.commit()?;
-                            Some(asset_id)
-                        }
+            let mut failed = false;
+            let new_logo = match logo {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    match self
+                        .import_legacy_asset(
+                            client,
+                            asset_root,
+                            &dataset_id,
+                            "team",
+                            &id,
+                            "logo",
+                            &url,
+                        )
+                        .await
+                    {
+                        Ok(asset_id) => Some(asset_id),
                         Err(_) => {
-                            logo_failed = true;
+                            failed = true;
                             Some("asset-unavailable".to_string())
                         }
                     }
-                } else {
-                    Some(url)
                 }
-            } else {
-                None
+                other => other,
             };
 
             self.conn.execute(
@@ -673,7 +763,7 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 params![new_logo, id, dataset_id],
             )?;
 
-            if logo_failed {
+            if failed {
                 failed_owner_ids.push(id);
             }
         }
@@ -693,7 +783,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
     ) -> SqlResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         let provenance = "detail";
-        let status = if is_empty { "EMPTY_CONFIRMED" } else { "COMPLETED" };
+        let status = if is_empty {
+            "EMPTY_CONFIRMED"
+        } else {
+            "COMPLETED"
+        };
         let is_empty_val = if is_empty { 1 } else { 0 };
 
         tx.execute(
@@ -756,7 +850,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "lineups" => {
                     if let Some(home_lineup) = data["home"].as_array() {
                         for player in home_lineup {
-                            let player_id = player["id"].as_str().or_else(|| player["playerId"].as_str()).unwrap_or("").to_string();
+                            let player_id = player["id"]
+                                .as_str()
+                                .or_else(|| player["playerId"].as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if !player_id.is_empty() {
                                 tx.execute(
                                     "INSERT INTO match_lineups (match_id, dataset_id, team_side, player_id, coach_id, position, shirt_number, starter, lineup_json, source_timestamp, provenance)
@@ -777,7 +875,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
                     }
                     if let Some(away_lineup) = data["away"].as_array() {
                         for player in away_lineup {
-                            let player_id = player["id"].as_str().or_else(|| player["playerId"].as_str()).unwrap_or("").to_string();
+                            let player_id = player["id"]
+                                .as_str()
+                                .or_else(|| player["playerId"].as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if !player_id.is_empty() {
                                 tx.execute(
                                     "INSERT INTO match_lineups (match_id, dataset_id, team_side, player_id, coach_id, position, shirt_number, starter, lineup_json, source_timestamp, provenance)
@@ -813,7 +915,9 @@ impl<'a> RepositoryUnitOfWork<'a> {
                 "h2h" => {
                     if let Some(history) = data["history"].as_array() {
                         for (idx, item) in history.iter().enumerate() {
-                            let ref_key = item["id"].as_str().map(String::from)
+                            let ref_key = item["id"]
+                                .as_str()
+                                .map(String::from)
                                 .unwrap_or_else(|| format!("h2h-{}", idx));
                             let item_str = item.to_string();
                             let h2h_hash = format!("{:x}", md5::compute(&item_str));
@@ -848,7 +952,11 @@ impl<'a> RepositoryUnitOfWork<'a> {
         delay_secs: i64,
         permanent: bool,
     ) -> SqlResult<()> {
-        let status = if permanent { "FAILED_PERMANENT" } else { "FAILED_RETRYABLE" };
+        let status = if permanent {
+            "FAILED_PERMANENT"
+        } else {
+            "FAILED_RETRYABLE"
+        };
         let modifier = format!("+{} seconds", delay_secs);
         self.conn.execute(
             "UPDATE detail_jobs

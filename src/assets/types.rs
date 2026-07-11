@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// An in-memory only image candidate representing a source URL and its association.
 /// This type does NOT derive Serialize or standard Debug to prevent URLs leaking into logs or database.

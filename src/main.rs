@@ -11,11 +11,11 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
+pub mod assets;
+pub mod detail;
 pub mod domain;
 pub mod feed;
 pub mod storage;
-pub mod detail;
-pub mod assets;
 
 static REQ_ID: AtomicI64 = AtomicI64::new(1000);
 fn next_req_id() -> i64 {
@@ -2438,7 +2438,7 @@ async fn send_command(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    
+
     // Clean up temporary assets directory
     let _ = crate::assets::store::clean_temp_assets(&cli.asset_root);
 
@@ -2496,7 +2496,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(failures) => {
                     println!("[Storage] Legacy asset conversion completed.");
                     if !failures.is_empty() {
-                        println!("[Storage] Failed to convert logos for owners: {:?}", failures);
+                        println!(
+                            "[Storage] Failed to convert logos for owners: {:?}",
+                            failures
+                        );
+                    }
+                    match repo.find_persisted_source_url_locations() {
+                        Ok(locations) if locations.is_empty() => {
+                            println!("[Storage] Source URL verification passed.");
+                        }
+                        Ok(locations) => {
+                            eprintln!(
+                                "[Storage] Source URLs remain in persisted locations: {:?}",
+                                locations
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("[Storage] Source URL verification failed: {}", error);
+                        }
                     }
                 }
                 Err(e) => {
@@ -2522,11 +2539,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
 
             let football_target = browser
-                .create_target(
-                    feed::browser::TargetRole::Live,
-                    1,
-                    "https://m.aiscore.com/",
-                )
+                .create_target(feed::browser::TargetRole::Live, 1, "https://m.aiscore.com/")
                 .await
                 .map_err(|error| feed::adapters::FeedError::Browser(error.to_string()))?;
 
@@ -2589,7 +2602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let detail_handle = tokio::spawn(detail_coord.run(detail_shutdown_rx));
 
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            
+
             let db_path_clone = resolved_db_path.clone();
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -2716,8 +2729,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Readiness constants
     let readiness_timeout = Duration::from_secs(30);
     let probe_interval = Duration::from_millis(800);
-
-
 
     // Track owned list target across reconnects
     let mut owned_list_target: Option<OwnedTarget> = None;
@@ -3050,8 +3061,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     eprintln!("[Crawler] Error recording sport readiness: {:?}", e);
                     continue;
                 }
-
-
 
                 // Monolithic direct-detail calls removed in Task 04.
                 // Detail worker now processes details via durable queue.
@@ -4546,13 +4555,14 @@ mod tests {
 
     #[test]
     fn asset_atomic_publication() {
-        use crate::assets::store::{publish_asset_file, clean_temp_assets};
-        let temp_root = std::env::temp_dir().join(format!("asset-test-root-{}", uuid::Uuid::new_v4()));
+        use crate::assets::store::{clean_temp_assets, publish_asset_file};
+        let temp_root =
+            std::env::temp_dir().join(format!("asset-test-root-{}", uuid::Uuid::new_v4()));
         let root_str = temp_root.to_string_lossy().to_string();
 
         let bytes = b"test-image-bytes";
         let hash = crate::assets::store::calculate_sha256(bytes);
-        
+
         let path = publish_asset_file(&root_str, "player", "p123", &hash, "png", bytes).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -4590,18 +4600,24 @@ mod tests {
 
         let bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0];
         let mut downloaded_results = std::collections::HashMap::new();
-        downloaded_results.insert("https://example.com/logo1.png".to_string(), Ok(crate::assets::download::DownloadedAsset {
-            bytes: bytes.clone(),
-            mime_type: "image/png".to_string(),
-            width: Some(32),
-            height: Some(32),
-        }));
-        downloaded_results.insert("https://example.com/logo2.png".to_string(), Ok(crate::assets::download::DownloadedAsset {
-            bytes: bytes.clone(),
-            mime_type: "image/png".to_string(),
-            width: Some(32),
-            height: Some(32),
-        }));
+        downloaded_results.insert(
+            0,
+            Ok(crate::assets::download::DownloadedAsset {
+                bytes: bytes.clone(),
+                mime_type: "image/png".to_string(),
+                width: Some(32),
+                height: Some(32),
+            }),
+        );
+        downloaded_results.insert(
+            1,
+            Ok(crate::assets::download::DownloadedAsset {
+                bytes: bytes.clone(),
+                mime_type: "image/png".to_string(),
+                width: Some(32),
+                height: Some(32),
+            }),
+        );
 
         let md5_logo1 = format!("asset-{:x}", md5::compute("https://example.com/logo1.png"));
         let md5_logo2 = format!("asset-{:x}", md5::compute("https://example.com/logo2.png"));
@@ -4623,17 +4639,26 @@ mod tests {
             &candidates,
             &downloaded_results,
             &root_str,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let count_assets: i64 = conn.query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0)).unwrap();
+        let count_assets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count_assets, 1);
 
-        let count_links: i64 = conn.query_row("SELECT COUNT(*) FROM asset_links", [], |r| r.get(0)).unwrap();
+        let count_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM asset_links", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count_links, 2);
 
-        let saved_json: String = conn.query_row(
-            "SELECT data_json FROM match_detail_data WHERE match_id='m1'", [], |r| r.get(0)
-        ).unwrap();
+        let saved_json: String = conn
+            .query_row(
+                "SELECT data_json FROM match_detail_data WHERE match_id='m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let val: serde_json::Value = serde_json::from_str(&saved_json).unwrap();
         let asset1 = val["logo1"].as_str().unwrap();
         let asset2 = val["logo2"].as_str().unwrap();
@@ -4649,16 +4674,18 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         let dataset_id = "dataset-1";
-        
+
         let tx = conn.unchecked_transaction().unwrap();
         crate::storage::repositories::plan_initial_detail_jobs(&tx, dataset_id, "match-1").unwrap();
         tx.commit().unwrap();
 
-        let urls_in_db: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM detail_jobs WHERE scheduled_at LIKE '%http%'",
-            [],
-            |r| r.get(0)
-        ).unwrap();
+        let urls_in_db: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM detail_jobs WHERE scheduled_at LIKE '%http%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(urls_in_db, 0);
     }
 
@@ -4677,8 +4704,9 @@ mod tests {
                 dataset_id TEXT NOT NULL DEFAULT 'legacy-dataset-id'
             )",
             [],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         conn.execute(
             "CREATE TABLE teams (
                 id TEXT PRIMARY KEY,
@@ -4689,7 +4717,8 @@ mod tests {
                 dataset_id TEXT NOT NULL DEFAULT 'legacy-dataset-id'
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO competitions (id, sport_id, name, logo, country_logo)
@@ -4701,7 +4730,8 @@ mod tests {
             "INSERT INTO teams (id, sport_id, name, logo)
              VALUES ('team-1', 1, 'Arsenal', 'https://example.com/team-logo.png')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS assets (
@@ -4718,7 +4748,8 @@ mod tests {
                 provenance TEXT NOT NULL DEFAULT 'local'
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS asset_links (
@@ -4732,7 +4763,8 @@ mod tests {
                 PRIMARY KEY (asset_id, dataset_id, entity_type, entity_id, role)
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS asset_jobs (
@@ -4750,20 +4782,26 @@ mod tests {
                 UNIQUE (asset_id, dataset_id)
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let repo = storage::repositories::RepositoryUnitOfWork::new(&conn);
-        let temp_root = std::env::temp_dir().join(format!("legacy-convert-{}", uuid::Uuid::new_v4()));
+        let temp_root =
+            std::env::temp_dir().join(format!("legacy-convert-{}", uuid::Uuid::new_v4()));
         let root_str = temp_root.to_string_lossy().to_string();
 
         let client = reqwest::Client::new();
         let failures = repo.convert_legacy_logos(&client, &root_str).await.unwrap();
 
-        assert!(failures.contains(&"comp-1".to_string()) || failures.contains(&"team-1".to_string()));
+        assert!(
+            failures.contains(&"comp-1".to_string()) || failures.contains(&"team-1".to_string())
+        );
 
-        let updated_comp_logo: String = conn.query_row(
-            "SELECT logo FROM competitions WHERE id='comp-1'", [], |r| r.get(0)
-        ).unwrap();
+        let updated_comp_logo: String = conn
+            .query_row("SELECT logo FROM competitions WHERE id='comp-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(updated_comp_logo, "asset-unavailable");
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -4773,13 +4811,33 @@ mod tests {
     fn source_url_no_leakage() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%http%'",
-            [],
-            |r| r.get(0)
-        ).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%http%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
+
+        let repo = storage::repositories::RepositoryUnitOfWork::new(&conn);
+        assert!(
+            repo.find_persisted_source_url_locations()
+                .unwrap()
+                .is_empty()
+        );
+
+        conn.execute(
+            "INSERT INTO sync_outbox (entity_type, entity_id, event_type, payload_json)
+             VALUES ('asset', 'asset-test', 'ASSET_UPLOAD_INTENT', '{\"source\":\"https://source.invalid/image.png\"}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            repo.find_persisted_source_url_locations().unwrap(),
+            vec!["sync_outbox.payload_json"]
+        );
     }
 
     #[tokio::test]
@@ -4792,7 +4850,8 @@ mod tests {
             std::time::Duration::from_millis(500),
             1,
             std::time::Duration::from_millis(100),
-        ).await;
+        )
+        .await;
         assert!(res.is_err());
     }
 }

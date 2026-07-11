@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod migration;
+pub mod repositories;
 pub mod schema;
 
 pub use backup::{
