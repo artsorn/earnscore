@@ -7,6 +7,9 @@ Before editing:
 - Use `.ai-agent/generated/runtime/search-allowlist.txt` and the package's relevant knowledge/codegraph/source snippets before opening additional files.
 - Open only the targeted source files needed for the task.
 - Do not automatically read or search runtime logs, token files, jsonl streams, cache, tmp, history, or token archives during normal coding.
+- Keep model-visible command output bounded. For commands that may emit more than about 200 lines, write the exact output to `.ai-agent/generated/runtime/tool-output/` and inspect a concise summary containing the exit code, errors, failing cases, and a small head/tail sample. Do not paste the raw artifact back into chat.
+- Never combine an unrelated command (`sed`, `rg`, tests, or `git status`) with `git diff` or `.ai-agent/bin/aia task-diff`. Request a diff only when the implementation changed and review actually needs it.
+- Use `.ai-agent/bin/aia validate -- <command> [args...]` for required validation so PASS, FAIL, BLOCKED_BY_ENVIRONMENT, and NOT_RUN are recorded from real exit status and output. For ambiguous permission/network-looking failures, use `--failure-kind fail` or `--failure-kind environment` only when the evidence proves which one applies.
 - Use at most `SEARCH_BUDGET` unique searches and do not repeat identical keyword searches.
 
 Reviewer Repair Mode:

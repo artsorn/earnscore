@@ -68,36 +68,7 @@ validate_positive_int() {
 
 record_token_usage() {
   local role="$1" model="$2" log_file="$3"
-  [[ -s "$log_file" ]] || return 0
-  python3 - "$RUNTIME/token-usage.jsonl" "$log_file" "$role" "$model" <<'PY'
-import datetime, json, re, sys
-out, log_file, role, model = sys.argv[1:5]
-text = open(log_file, encoding="utf-8", errors="replace").read()
-patterns = [
-    r"tokens\s+used\s*[:\n ]\s*([0-9][0-9,]*)",
-    r"total[_ ]tokens\s*[=:]\s*([0-9][0-9,]*)",
-    r"total\s+tokens\s*[:=]\s*([0-9][0-9,]*)",
-]
-tokens = None
-for pattern in patterns:
-    matches = re.findall(pattern, text, flags=re.I)
-    if matches:
-        tokens = int(matches[-1].replace(",", ""))
-        break
-if tokens is None:
-    raise SystemExit(0)
-row = {
-    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "role": role,
-    "model": model,
-    "round": 0,
-    "task": "final-review",
-    "tokens": tokens,
-    "log_file": log_file,
-}
-with open(out, "a", encoding="utf-8") as f:
-    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-PY
+  agent_record_token_usage "$RUNTIME/token-usage.jsonl" "$log_file" "$role" "$model" 0 "final-review" "${CURRENT_PROMPT_FILE:-}"
 }
 
 read_final_verdict() {
@@ -121,15 +92,17 @@ PY
 
 run_agent_prompt() {
   local role="$1" model="$2" effort="$3" timeout_value="$4" prompt_file="$5" log_file="$6"
-  local cli code=0
+  local cli effective_model code=0
   cli="$(agent_cli_for_role "$role")" || return $?
-  : > "$log_file"
-  event "$role" "started cli=$cli model=$model effort=${effort:-default}"
+  effective_model="$(agent_effective_model_for_role "$role" "$model" "$cli")" || return $?
+  agent_reset_output_logs "$log_file"
+  CURRENT_PROMPT_FILE="$prompt_file"
+  event "$role" "started cli=$cli model=$effective_model effort=${effort:-default}"
   set +e
   run_agent_role "$role" "$prompt_file" "$model" "$cli" "$timeout_value" "$log_file" "$effort" "$SANDBOX"
   code=$?
   set -e
-  record_token_usage "$role" "$model" "$log_file"
+  record_token_usage "$role" "$effective_model" "$log_file"
   if [[ "$code" -ne 0 ]]; then
     event "$role" "failed exit=$code"
     return "$code"
@@ -329,6 +302,17 @@ run_final_review_once() {
   echo "Final reviewer verdict: $verdict"
   event "final-review" "verdict=$verdict round=$round_label"
   if [[ "$verdict" == "PASS" ]]; then
+    if ! validation_blockers="$(agent_validation_gate "$RUNTIME")"; then
+      verdict="BLOCKED"
+      {
+        echo "BLOCKED"
+        echo "Final Reviewer returned PASS, but validation is not clean:"
+        printf '%s\n' "$validation_blockers"
+      } > "$RUNTIME/final-verdict.txt"
+      echo "Final reviewer validation gate: BLOCKED"
+      event "final-review" "validation blocked: ${validation_blockers//$'\n'/; }"
+      return 1
+    fi
     return 0
   fi
   return 1

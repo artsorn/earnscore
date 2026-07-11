@@ -111,11 +111,94 @@ if initial > max_tokens:
         path.write_text(text, encoding="utf-8")
 
 final = estimate(text)
-print(f"Input context estimate for {role}: {final:,} tokens (limit {max_tokens:,}).")
+print(f"Prompt file estimate for {role}: {final:,} tokens (prompt limit {max_tokens:,}).")
+print("Actual model input also includes system/developer instructions and resumed-session history; see token-usage.jsonl after the turn.")
 if steps:
     print("Token guard trimmed optional package sections: " + ", ".join(dict.fromkeys(steps)))
 elif initial > max_tokens and final > max_tokens:
     print("Token guard warning: required prompt sections still exceed MAX_CONTEXT_TOKENS.")
+PY
+}
+
+agent_raw_log_file() {
+  local log_file="$1"
+  case "${RAW_LOG_COMPRESSION:-gzip}" in
+    gzip) printf '%s.raw.log.gz\n' "${log_file%.log}" ;;
+    none) printf '%s.raw.log\n' "${log_file%.log}" ;;
+    *) echo "Invalid RAW_LOG_COMPRESSION: ${RAW_LOG_COMPRESSION:-}" >&2; return 2 ;;
+  esac
+}
+
+agent_reset_output_logs() {
+  local log_file="$1" raw_log
+  raw_log="$(agent_raw_log_file "$log_file")" || return $?
+  : > "$log_file"
+  rm -f "$raw_log"
+}
+
+agent_capture_command() {
+  local visible_log="$1" raw_log="$2"; shift 2
+  local pipeline_script="${AI_DIR:-.ai-agent}/scripts/agent-output-pipeline.py"
+  if [[ ! -f "$pipeline_script" ]]; then
+    "$@" 2>&1 | tee -a "$visible_log"
+    return "${PIPESTATUS[0]}"
+  fi
+  "$@" 2>&1 | python3 "$pipeline_script" \
+    --raw-log "$raw_log" \
+    --visible-log "$visible_log" \
+    --max-lines "${VISIBLE_LOG_MAX_LINES:-1200}" \
+    --max-bytes "${VISIBLE_LOG_MAX_BYTES:-160000}" \
+    --diff-lines "${VISIBLE_LOG_DIFF_MAX_LINES:-160}"
+  return "${PIPESTATUS[0]}"
+}
+
+codex_feature_available() {
+  local feature="$1"
+  command -v codex >/dev/null 2>&1 || return 1
+  codex features list 2>/dev/null | awk '{print $1}' | grep -qx "$feature"
+}
+
+codex_context_config_args() {
+  local -n target="$1"
+  local tool_limit="${CODEX_TOOL_OUTPUT_TOKEN_LIMIT:-12000}"
+  local compact_limit="${CODEX_AUTO_COMPACT_TOKEN_LIMIT:-80000}"
+  local rollout_limit="${CODEX_ROLLOUT_BUDGET_TOKENS:-160000}"
+  [[ "$tool_limit" =~ ^[0-9]+$ ]] && target+=(-c "tool_output_token_limit=$tool_limit")
+  [[ "$compact_limit" =~ ^[0-9]+$ ]] && target+=(-c "model_auto_compact_token_limit=$compact_limit")
+  if [[ "$rollout_limit" =~ ^[0-9]+$ && "$rollout_limit" -gt 0 ]] && codex_feature_available rollout_budget; then
+    target+=(-c "features.rollout_budget={ enabled = true, limit_tokens = $rollout_limit, reminder_at_remaining_tokens = [40000, 20000] }")
+  fi
+}
+
+agent_record_token_usage() {
+  local usage_file="$1" log_file="$2" role="$3" model="$4" round_no="${5:-0}" task="${6:-}" prompt_file="${7:-}"
+  local script="${AI_DIR:-.ai-agent}/scripts/agent-token-accounting.py" raw_log
+  [[ -f "$script" ]] || return 0
+  raw_log="$(agent_raw_log_file "$log_file")" || return $?
+  local args=(--usage-file "$usage_file" --log-file "$log_file" --raw-log "$raw_log"
+    --role "$role" --model "$model" --round "$round_no" --task "$task")
+  [[ -n "$prompt_file" ]] && args+=(--prompt-file "$prompt_file")
+  python3 "$script" "${args[@]}"
+}
+
+agent_validation_gate() {
+  local runtime_dir="${1:-${RUNTIME:-${RUNTIME_DIR:-.ai-agent/generated/runtime}}}"
+  local usage_file="$runtime_dir/validation-status.jsonl"
+  [[ -s "$usage_file" ]] || return 0
+  python3 - "$usage_file" <<'PY'
+import json, sys
+latest = {}
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        row = json.loads(line)
+    except Exception:
+        continue
+    key = row.get("command") or "NOT_RUN:" + (row.get("reason") or "unspecified")
+    latest[key] = row
+bad = [row for row in latest.values() if row.get("status") != "PASS"]
+for row in bad:
+    print(f"{row.get('status')}: {row.get('command') or row.get('reason')}")
+raise SystemExit(1 if bad else 0)
 PY
 }
 
@@ -188,11 +271,12 @@ codex_extract_session_id_from_log() {
   local log_file="$1"
   [[ -s "$log_file" ]] || return 1
   python3 - "$log_file" <<'PY'
-import json, re, sys
+import gzip, json, re, sys
 path = sys.argv[1]
 latest = ""
 uuid_re = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-with open(path, encoding="utf-8", errors="replace") as f:
+opener = gzip.open if path.endswith(".gz") else open
+with opener(path, "rt", encoding="utf-8", errors="replace") as f:
     for line in f:
         text = line.strip()
         if text == "user":
@@ -201,7 +285,7 @@ with open(path, encoding="utf-8", errors="replace") as f:
         if match:
             print(match.group(1))
             raise SystemExit
-with open(path, encoding="utf-8", errors="replace") as f:
+with opener(path, "rt", encoding="utf-8", errors="replace") as f:
     for line in f:
         text = line.strip()
         if not text:
@@ -270,10 +354,10 @@ codex_session_resolve() {
 }
 
 codex_session_save_created() {
-  local role="$1" log_file="$2" session_id display
+  local role="$1" log_file="$2" raw_log="${3:-$2}" session_id display
   [[ "${USE_PERSISTENT_SESSIONS:-true}" == "true" ]] || return 0
   [[ "${CODEX_SESSION_SOURCE:-new}" == "new" ]] || return 0
-  session_id="$(codex_extract_session_id_from_log "$log_file" || true)"
+  session_id="$(codex_extract_session_id_from_log "$raw_log" || true)"
   if codex_session_is_valid "$session_id"; then
     display="$(codex_session_display_for_key "$CODEX_SESSION_KEY")"
     mkdir -p "$(dirname "$CODEX_SESSION_FILE")"
@@ -288,18 +372,22 @@ codex_session_save_created() {
 
 codex_run_once() {
   local model="$1" effort="$2" sandbox="$3" timeout_value="$4" prompt_file="$5" log_file="$6" role="$7"
-  local code
+  local code raw_log
+  raw_log="$(agent_raw_log_file "$log_file")" || return $?
   codex_prompt_guard_file "$prompt_file" "$log_file" "$role"
+
+  local context_args=()
+  codex_context_config_args context_args
 
   if [[ "${USE_PERSISTENT_SESSIONS:-true}" != "true" ]]; then
     printf 'USE_PERSISTENT_SESSIONS=false; starting fresh %s session for this invocation.\n' "$role" | tee -a "$log_file"
     set +e
     if [[ -n "$effort" ]]; then
-      timeout "$timeout_value" codex exec -m "$model" -c "model_reasoning_effort=$effort" -s "$sandbox" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" -m "$model" -c "model_reasoning_effort=$effort" -s "$sandbox" - < "$prompt_file"
+      code=$?
     else
-      timeout "$timeout_value" codex exec -m "$model" -s "$sandbox" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" -m "$model" -s "$sandbox" - < "$prompt_file"
+      code=$?
     fi
     set -e
     return "$code"
@@ -309,24 +397,24 @@ codex_run_once() {
   set +e
   if [[ -n "${CODEX_SESSION_ID:-}" ]]; then
     if [[ -n "$effort" ]]; then
-      timeout "$timeout_value" codex exec resume -m "$model" -c "model_reasoning_effort=$effort" "$CODEX_SESSION_ID" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" resume -m "$model" -c "model_reasoning_effort=$effort" "$CODEX_SESSION_ID" - < "$prompt_file"
+      code=$?
     else
-      timeout "$timeout_value" codex exec resume -m "$model" "$CODEX_SESSION_ID" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" resume -m "$model" "$CODEX_SESSION_ID" - < "$prompt_file"
+      code=$?
     fi
   else
     if [[ -n "$effort" ]]; then
-      timeout "$timeout_value" codex exec -m "$model" -c "model_reasoning_effort=$effort" -s "$sandbox" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" -m "$model" -c "model_reasoning_effort=$effort" -s "$sandbox" - < "$prompt_file"
+      code=$?
     else
-      timeout "$timeout_value" codex exec -m "$model" -s "$sandbox" - < "$prompt_file" 2>&1 | tee -a "$log_file"
-      code=${PIPESTATUS[0]}
+      agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" codex exec --json "${context_args[@]}" -m "$model" -s "$sandbox" - < "$prompt_file"
+      code=$?
     fi
   fi
   set -e
   if [[ "$code" -eq 0 ]]; then
-    codex_session_save_created "$role" "$log_file"
+    codex_session_save_created "$role" "$log_file" "$raw_log"
   fi
   return "$code"
 }
@@ -479,12 +567,13 @@ run_agy_role() {
     return 127
   fi
 
-  local agy_model project conversation prompt prompt_bytes max_inline code prompt_dir agy_cli_log
+  local agy_model project conversation prompt prompt_bytes max_inline code prompt_dir agy_cli_log raw_log
   agy_model="$(agy_role_model "$role" "$model")"
   project="$(agy_role_project "$role")"
   conversation="$(agy_role_conversation "$role")"
   prompt_bytes="$(wc -c < "$prompt_file" | tr -d '[:space:]')"
   max_inline="${AGY_INLINE_PROMPT_MAX_BYTES:-120000}"
+  raw_log="$(agent_raw_log_file "$log_file")" || return $?
 
   local cmd=(agy)
   [[ -n "$agy_model" ]] && cmd+=(--model "$agy_model")
@@ -522,8 +611,8 @@ run_agy_role() {
   printf 'AGY effective model: %s\n' "$agy_model" | tee -a "$log_file"
 
   set +e
-  timeout "$timeout_value" "${cmd[@]}" 2>&1 | tee -a "$log_file"
-  code=${PIPESTATUS[0]}
+  agent_capture_command "$log_file" "$raw_log" timeout "$timeout_value" "${cmd[@]}"
+  code=$?
   set -e
   return "$code"
 }

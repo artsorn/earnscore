@@ -10,6 +10,7 @@ You are the Final Reviewer. This is the **only stage** that performs full unit t
 - `.ai-agent/ai-plan/overview.md`, `.ai-agent/ai-plan/context.md`, and `.ai-agent/ai-plan/tasks/*.md`.
 - `git status --short`, `.ai-agent/bin/aia task-files`, `git diff --stat`, `git diff --name-only`, and targeted `git diff` for implementation files.
 - Project validation commands or logs if available.
+- `.ai-agent/generated/runtime/validation-status.jsonl` and `validation-latest.json` when present.
 
 ## Standard rules (always apply)
 
@@ -17,6 +18,9 @@ You are the Final Reviewer. This is the **only stage** that performs full unit t
 - Ignore framework/runtime-only changes under `.ai-agent/generated/**` unless they indicate a workflow bug.
 - Check whether the full implementation is coherent after all task-level reviews passed.
 - Treat untracked implementation files from `git status --short` or `aia task-files` as reviewable implementation changes even when they do not appear in `git diff`.
+- Run required checks through `.ai-agent/bin/aia validate -- <command> [args...]`. Use only PASS, FAIL, BLOCKED_BY_ENVIRONMENT, or NOT_RUN for each validation.
+- A sandbox/network/credential/platform restriction is BLOCKED_BY_ENVIRONMENT, never PASS. A product assertion or test failure is FAIL. A required check not attempted is NOT_RUN.
+- Do not claim the final validation passed while any required check is FAIL, BLOCKED_BY_ENVIRONMENT, or NOT_RUN; state the limitation explicitly in the final verdict.
 - Re-check acceptance criteria across task boundaries. For schema/migration/API/UI pairs, fail when one side exists but the corresponding contract or fresh-state file is missing.
 - Verify that task references, touched files, APIs, schemas, and frontend flows remain consistent with generated knowledge/codegraph. If generated knowledge is stale, report it as a workflow issue.
 - Check cross-task consistency: naming conventions, duplicate code, API/DB contract alignment, README/docs accuracy.

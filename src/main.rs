@@ -11,6 +11,8 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
+pub mod storage;
+
 static REQ_ID: AtomicI64 = AtomicI64::new(1000);
 fn next_req_id() -> i64 {
     REQ_ID.fetch_add(1, Ordering::SeqCst)
@@ -76,6 +78,23 @@ fn parse_detail_concurrency(s: &str) -> Result<usize, String> {
 enum Commands {
     Football,
     Basketball,
+    /// Apply the local v3 migration, optionally after creating a verified backup.
+    Migrate {
+        #[arg(long)]
+        backup_destination: Option<String>,
+    },
+    /// Create a verified SQLite backup without mutating the source database.
+    Backup {
+        #[arg(long)]
+        destination: String,
+    },
+    /// Restore a verified backup through a temporary integrity-checked copy.
+    Restore {
+        #[arg(long)]
+        backup: String,
+        #[arg(long)]
+        destination: String,
+    },
 }
 
 // ── Path / file helpers ───────────────────────────────────────────────────────
@@ -160,43 +179,7 @@ fn verify_db_identity(
 }
 
 fn init_dataset_id(conn: &Connection) -> SqlResult<String> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'active_dataset_id'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    if let Some(uuid) = existing {
-        conn.execute(
-            "INSERT OR IGNORE INTO datasets (dataset_id, created_at, generation_order, schema_generation) VALUES (?1, ?2, ?3, 2)",
-            params![uuid, chrono::Utc::now().to_rfc3339(), chrono::Utc::now().timestamp_millis()],
-        )?;
-        return Ok(uuid);
-    }
-
-    let now = chrono::Utc::now();
-    let new_uuid = uuid::Uuid::now_v7().to_string();
-    let created_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let generation_order = now.timestamp_millis();
-
-    conn.execute(
-        "INSERT OR IGNORE INTO datasets (dataset_id, created_at, generation_order, schema_generation) VALUES (?1, ?2, ?3, 2)",
-        params![new_uuid, created_at, generation_order],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('active_dataset_id', ?1)",
-        params![new_uuid],
-    )?;
-
-    let active_uuid: String = conn.query_row(
-        "SELECT value FROM settings WHERE key = 'active_dataset_id'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    Ok(active_uuid)
+    storage::init_dataset_id(conn)
 }
 
 // ── Data models ───────────────────────────────────────────────────────────────
@@ -1281,374 +1264,19 @@ async fn fetch_detail_from_target(
 // ── Database ──────────────────────────────────────────────────────────────────
 
 fn open_db(db_path: &str) -> SqlResult<Connection> {
-    let conn = Connection::open(db_path)?;
-    conn.pragma_update(None, "journal_mode", &"WAL")?;
-    conn.pragma_update(None, "busy_timeout", &"5000")?;
-    Ok(conn)
+    storage::open_db(db_path)
 }
 
 fn init_db(db_path: &str) -> SqlResult<Connection> {
-    let conn = open_db(db_path)?;
-    run_migrations(&conn)?;
-    Ok(conn)
+    storage::init_db(db_path)
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> SqlResult<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name.eq_ignore_ascii_case(column) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn add_column_if_not_exists(
-    conn: &Connection,
-    table: &str,
-    column_def: &str,
-    column_name: &str,
-) -> SqlResult<()> {
-    if !column_exists(conn, table, column_name)? {
-        conn.execute(
-            &format!("ALTER TABLE {} ADD COLUMN {}", table, column_def),
-            [],
-        )?;
-    }
-    Ok(())
+    storage::column_exists(conn, table, column)
 }
 
 fn run_migrations(conn: &Connection) -> SqlResult<()> {
-    // 1. Ensure baseline datasets registry exists
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS datasets (
-            dataset_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            generation_order INTEGER NOT NULL DEFAULT 0,
-            schema_generation INTEGER DEFAULT 2
-         )",
-        [],
-    )?;
-
-    // CREATE TABLE IF NOT EXISTS does not upgrade an existing registry. Add
-    // generation columns before the first statement that references them.
-    add_column_if_not_exists(
-        conn,
-        "datasets",
-        "generation_order INTEGER NOT NULL DEFAULT 0",
-        "generation_order",
-    )?;
-    add_column_if_not_exists(
-        conn,
-        "datasets",
-        "schema_generation INTEGER DEFAULT 2",
-        "schema_generation",
-    )?;
-    // Registries created by the pre-generation schema receive the column's
-    // default zero. Protocol v2 requires a positive monotonic order, so
-    // backfill real datasets before the sync worker can read them.
-    conn.execute(
-        "UPDATE datasets
-         SET generation_order = COALESCE(
-             CAST(strftime('%s', created_at) AS INTEGER) * 1000,
-             CAST(strftime('%s', 'now') AS INTEGER) * 1000
-         ) + rowid
-         WHERE generation_order < 1 AND dataset_id <> 'legacy-dataset-id'",
-        [],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO datasets (dataset_id, created_at, generation_order, schema_generation)
-         VALUES ('legacy-dataset-id', datetime('now'), 0, 2)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS dataset_sports (
-            dataset_id TEXT NOT NULL,
-            sport_id INTEGER NOT NULL CHECK (sport_id IN (1, 2)),
-            captured_at TEXT NOT NULL,
-            synced INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (dataset_id, sport_id)
-         )",
-        [],
-    )?;
-
-    // 2. Ensure baseline tables exist using latest Gen 2 schema
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS competitions (
-            id TEXT,
-            sport_id INTEGER,
-            name TEXT,
-            logo TEXT,
-            slug TEXT,
-            country_name TEXT,
-            country_logo TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-         )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS teams (
-            id TEXT,
-            sport_id INTEGER,
-            name TEXT,
-            logo TEXT,
-            slug TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-         )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS matches (
-            id TEXT,
-            sport_id INTEGER,
-            competition_id TEXT,
-            home_team_id TEXT,
-            away_team_id TEXT,
-            match_time INTEGER,
-            status_id INTEGER,
-            home_scores TEXT,
-            away_scores TEXT,
-            is_live INTEGER NOT NULL DEFAULT 0,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-         )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-         )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS match_details (
-            match_id TEXT,
-            sport_id INTEGER,
-            incidents TEXT,
-            stats TEXT,
-            lineups TEXT,
-            odds TEXT,
-            h2h TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            last_updated INTEGER,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (match_id, dataset_id)
-         )",
-        [],
-    )?;
-
-    // 3. Ensure baseline columns from 0001 are present if we were on a legacy DB
-    let tx = conn.unchecked_transaction()?;
-    add_column_if_not_exists(&tx, "competitions", "raw_payload TEXT", "raw_payload")?;
-    add_column_if_not_exists(&tx, "competitions", "synced INTEGER DEFAULT 0", "synced")?;
-    add_column_if_not_exists(&tx, "competitions", "updated_at TEXT", "updated_at")?;
-
-    add_column_if_not_exists(&tx, "teams", "raw_payload TEXT", "raw_payload")?;
-    add_column_if_not_exists(&tx, "teams", "synced INTEGER DEFAULT 0", "synced")?;
-    add_column_if_not_exists(&tx, "teams", "updated_at TEXT", "updated_at")?;
-
-    let matches_had_is_live = column_exists(&tx, "matches", "is_live")?;
-    add_column_if_not_exists(
-        &tx,
-        "matches",
-        "is_live INTEGER NOT NULL DEFAULT 0",
-        "is_live",
-    )?;
-    if !matches_had_is_live {
-        tx.execute(
-            "UPDATE matches
-             SET is_live = CASE
-               WHEN sport_id = 1 AND status_id IN (2, 3, 4, 5, 6, 7) THEN 1
-               WHEN sport_id = 2 AND status_id IN (2, 3, 4, 5, 6, 7, 9) THEN 1
-               ELSE 0
-             END",
-            [],
-        )?;
-    }
-    add_column_if_not_exists(&tx, "matches", "raw_payload TEXT", "raw_payload")?;
-    add_column_if_not_exists(&tx, "matches", "synced INTEGER DEFAULT 0", "synced")?;
-    add_column_if_not_exists(&tx, "matches", "updated_at TEXT", "updated_at")?;
-
-    add_column_if_not_exists(&tx, "match_details", "raw_payload TEXT", "raw_payload")?;
-    add_column_if_not_exists(&tx, "match_details", "synced INTEGER DEFAULT 0", "synced")?;
-    add_column_if_not_exists(&tx, "match_details", "updated_at TEXT", "updated_at")?;
-    tx.commit()?;
-
-    // 4. If dataset_id doesn't exist, we must migrate to the composite primary key schema
-    if !column_exists(conn, "competitions", "dataset_id")? {
-        let tx = conn.unchecked_transaction()?;
-
-        tx.execute(
-            "CREATE TABLE competitions_new (
-            id TEXT,
-            sport_id INTEGER,
-            name TEXT,
-            logo TEXT,
-            slug TEXT,
-            country_name TEXT,
-            country_logo TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-        )",
-            [],
-        )?;
-        tx.execute("INSERT INTO competitions_new (id, sport_id, name, logo, slug, country_name, country_logo, raw_payload, synced, updated_at, dataset_id)
-                    SELECT id, sport_id, name, logo, slug, country_name, country_logo, raw_payload, synced, updated_at, 'legacy-dataset-id' FROM competitions", [])?;
-        tx.execute("DROP TABLE competitions", [])?;
-        tx.execute("ALTER TABLE competitions_new RENAME TO competitions", [])?;
-
-        tx.execute(
-            "CREATE TABLE teams_new (
-            id TEXT,
-            sport_id INTEGER,
-            name TEXT,
-            logo TEXT,
-            slug TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-        )",
-            [],
-        )?;
-        tx.execute("INSERT INTO teams_new (id, sport_id, name, logo, slug, raw_payload, synced, updated_at, dataset_id)
-                    SELECT id, sport_id, name, logo, slug, raw_payload, synced, updated_at, 'legacy-dataset-id' FROM teams", [])?;
-        tx.execute("DROP TABLE teams", [])?;
-        tx.execute("ALTER TABLE teams_new RENAME TO teams", [])?;
-
-        tx.execute(
-            "CREATE TABLE matches_new (
-            id TEXT,
-            sport_id INTEGER,
-            competition_id TEXT,
-            home_team_id TEXT,
-            away_team_id TEXT,
-            match_time INTEGER,
-            status_id INTEGER,
-            home_scores TEXT,
-            away_scores TEXT,
-            is_live INTEGER NOT NULL DEFAULT 0,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (id, dataset_id)
-        )",
-            [],
-        )?;
-        tx.execute("INSERT INTO matches_new (id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores, is_live, raw_payload, synced, updated_at, dataset_id)
-                    SELECT id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores,
-                           CASE
-                             WHEN sport_id = 1 AND status_id IN (2, 3, 4, 5, 6, 7) THEN 1
-                             WHEN sport_id = 2 AND status_id IN (2, 3, 4, 5, 6, 7, 9) THEN 1
-                             ELSE 0
-                           END,
-                           raw_payload, synced, updated_at, 'legacy-dataset-id' FROM matches", [])?;
-        tx.execute("DROP TABLE matches", [])?;
-        tx.execute("ALTER TABLE matches_new RENAME TO matches", [])?;
-
-        tx.execute(
-            "CREATE TABLE match_details_new (
-            match_id TEXT,
-            sport_id INTEGER,
-            incidents TEXT,
-            stats TEXT,
-            lineups TEXT,
-            odds TEXT,
-            h2h TEXT,
-            raw_payload TEXT,
-            synced INTEGER DEFAULT 0,
-            last_updated INTEGER,
-            updated_at TEXT,
-            dataset_id TEXT,
-            PRIMARY KEY (match_id, dataset_id)
-        )",
-            [],
-        )?;
-        tx.execute("INSERT INTO match_details_new (match_id, sport_id, incidents, stats, lineups, odds, h2h, raw_payload, synced, last_updated, updated_at, dataset_id)
-                    SELECT match_id, sport_id, incidents, stats, lineups, odds, h2h, raw_payload, synced, last_updated, updated_at, 'legacy-dataset-id' FROM match_details", [])?;
-        tx.execute("DROP TABLE match_details", [])?;
-        tx.execute("ALTER TABLE match_details_new RENAME TO match_details", [])?;
-
-        tx.commit()?;
-    }
-
-    // 5. Ensure performance indexes are set up
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("DROP INDEX IF EXISTS idx_matches_list", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_matches_competition", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_matches_home_team", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_matches_away_team", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_match_details_lookup", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_competitions_sport", [])?;
-    tx.execute("DROP INDEX IF EXISTS idx_teams_sport", [])?;
-
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_matches_list ON matches (dataset_id, is_live, sport_id, status_id, match_time)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_matches_competition ON matches (dataset_id, competition_id)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_matches_home_team ON matches (dataset_id, home_team_id)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_matches_away_team ON matches (dataset_id, away_team_id)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_match_details_lookup ON match_details (dataset_id, match_id, sport_id)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_competitions_sport ON competitions (dataset_id, sport_id)",
-        [],
-    )?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_teams_sport ON teams (dataset_id, sport_id)",
-        [],
-    )?;
-
-    // Default settings
-    tx.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('sync_interval_mins', '5')",
-        [],
-    )?;
-    tx.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('cf_worker_url', 'http://127.0.0.1:8080')", [])?;
-    tx.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('api_token', 'super-secret-token')",
-        [],
-    )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('detail_update_interval_secs', '60')",
-        [],
-    )?;
-
-    tx.commit()?;
-    Ok(())
+    storage::run_migrations(conn)
 }
 
 fn sanitize_json(val: &mut Value) {
@@ -2782,6 +2410,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     let resolved_db_path = get_absolute_normalized_path(&cli.db_path)?;
+
+    match &cli.command {
+        Commands::Backup { destination } => {
+            let destination = get_absolute_normalized_path(destination)?;
+            let manifest = storage::create_verified_backup(&resolved_db_path, destination)?;
+            println!(
+                "[Storage] Verified backup created: {} ({} bytes, checksum={})",
+                manifest.destination.display(),
+                manifest.size_bytes,
+                manifest.checksum
+            );
+            return Ok(());
+        }
+        Commands::Restore {
+            backup,
+            destination,
+        } => {
+            let backup = get_absolute_normalized_path(backup)?;
+            let destination = get_absolute_normalized_path(destination)?;
+            let manifest = storage::restore_verified_backup(&backup, &destination)?;
+            println!(
+                "[Storage] Verified restore completed: {} ({} bytes, checksum={})",
+                manifest.destination.display(),
+                manifest.size_bytes,
+                manifest.checksum
+            );
+            return Ok(());
+        }
+        Commands::Migrate { backup_destination } => {
+            if let Some(destination) = backup_destination {
+                let destination = get_absolute_normalized_path(destination)?;
+                let manifest = storage::create_verified_backup(&resolved_db_path, &destination)?;
+                println!(
+                    "[Storage] Pre-migration backup verified: {} ({} bytes, checksum={})",
+                    manifest.destination.display(),
+                    manifest.size_bytes,
+                    manifest.checksum
+                );
+            }
+            let _ = init_db(&resolved_db_path)?;
+            println!(
+                "[Storage] SQLite v3 migration completed: {}",
+                resolved_db_path
+            );
+            return Ok(());
+        }
+        Commands::Football | Commands::Basketball => {}
+    }
     let _ = init_db(&resolved_db_path)?;
 
     let mut dataset_id = {
@@ -2793,6 +2469,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let adapter: Box<dyn SportAdapter> = match cli.command {
         Commands::Football => Box::new(FootballAdapter),
         Commands::Basketball => Box::new(BasketballAdapter),
+        Commands::Migrate { .. } | Commands::Backup { .. } | Commands::Restore { .. } => {
+            unreachable!("storage subcommands return before crawler startup")
+        }
     };
     let sport_id = adapter.sport_id();
 

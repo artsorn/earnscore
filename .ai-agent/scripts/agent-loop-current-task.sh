@@ -61,36 +61,7 @@ json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))
 
 record_token_usage() {
   local role="$1" model="$2" round_no="$3" log_file="$4"
-  [[ -s "$log_file" ]] || return 0
-  python3 - "$RUNTIME/token-usage.jsonl" "$log_file" "$role" "$model" "$round_no" "${TASK:-}" <<'PY'
-import datetime, json, re, sys
-out, log_file, role, model, round_no, task = sys.argv[1:7]
-text = open(log_file, encoding="utf-8", errors="replace").read()
-patterns = [
-    r"tokens\s+used\s*[:\n ]\s*([0-9][0-9,]*)",
-    r"total[_ ]tokens\s*[=:]\s*([0-9][0-9,]*)",
-    r"total\s+tokens\s*[:=]\s*([0-9][0-9,]*)",
-]
-tokens = None
-for pattern in patterns:
-    matches = re.findall(pattern, text, flags=re.I)
-    if matches:
-        tokens = int(matches[-1].replace(",", ""))
-        break
-if tokens is None:
-    raise SystemExit(0)
-row = {
-    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "role": role,
-    "model": model,
-    "round": int(round_no or 0),
-    "task": task,
-    "tokens": tokens,
-    "log_file": log_file,
-}
-with open(out, "a", encoding="utf-8") as f:
-    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-PY
+  agent_record_token_usage "$RUNTIME/token-usage.jsonl" "$log_file" "$role" "$model" "$round_no" "${TASK:-}" "$RUNTIME/merged-${role}.prompt.md"
 }
 
 write_status() {
@@ -353,7 +324,7 @@ run_task_agent_role() {
   write_status "$role" "$TASK" "$round" "Running $role with $cli/$effective_model" ""
   local output_log="$RUNTIME/${role}-round-${round}.log"
   local code=0
-  : > "$output_log"
+  agent_reset_output_logs "$output_log"
   set +e
   CODEX_SESSION_SCOPE_ID="$TASK" run_agent_role "$role" "$prompt_file" "$model" "$cli" "$CODEX_TIMEOUT" "$output_log" "$effort" "$SANDBOX"
   code=$?
@@ -462,6 +433,18 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
   verdict="$(read_latest_verdict || true)"
   normalize_verdict_file "${verdict:-FAIL}"
   event "reviewer" "verdict=${verdict:-unknown}"
+  if [[ "$verdict" == "PASS" ]]; then
+    if ! validation_blockers="$(agent_validation_gate "$RUNTIME")"; then
+      verdict="BLOCKED"
+      {
+        echo "BLOCKED"
+        echo "Reviewer returned PASS, but required validation is not clean:"
+        printf '%s\n' "$validation_blockers"
+      } > "$VERDICT_FILE"
+      write_reviewer_summary "$round" "$RUNTIME/reviewer-round-${round}.log" "BLOCKED"
+      event "validation" "blocked task pass: ${validation_blockers//$'\n'/; }"
+    fi
+  fi
   if [[ "$verdict" == "PASS" ]]; then
     echo "PASS"
     if [[ "$AUTO_MARK_TASK_PASSED" == "true" ]]; then mark_task_status "$TASK" "Passed"; fi

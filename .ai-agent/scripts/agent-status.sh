@@ -86,3 +86,22 @@ echo "- AUTO_RESTORE_OUT_OF_SCOPE : ${AUTO_RESTORE_OUT_OF_SCOPE:-true}"
 echo "- REVIEW_ALLOWED_ONLY       : ${REVIEW_ALLOWED_ONLY:-true}"
 echo "- AUTO_MARK_TASK_PASSED     : ${AUTO_MARK_TASK_PASSED:-true}"
 echo "- STATUS_JSON               : ${STATUS_JSON:-$AI_DIR/generated/status.json}"
+echo "- CODEX_TOOL_OUTPUT_LIMIT   : ${CODEX_TOOL_OUTPUT_TOKEN_LIMIT:-12000}"
+echo "- CODEX_AUTO_COMPACT        : ${CODEX_AUTO_COMPACT_TOKEN_LIMIT:-80000}"
+echo "- CODEX_ROLLOUT_BUDGET      : ${CODEX_ROLLOUT_BUDGET_TOKENS:-160000}"
+
+if [[ -f "$RUNTIME/validation-latest.json" ]]; then
+  echo
+  echo "Validation"
+  python3 - "$RUNTIME/validation-latest.json" <<'PY'
+import json, sys
+try:
+    row = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception as exc:
+    print(f"- Latest     : unreadable ({exc})")
+else:
+    print(f"- Latest     : {row.get('status', 'unknown')}")
+    print(f"- Command    : {row.get('command', '')}")
+    print(f"- Reason     : {row.get('reason', '')}")
+PY
+fi

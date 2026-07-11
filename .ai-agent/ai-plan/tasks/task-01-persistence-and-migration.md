@@ -1,8 +1,7 @@
 # Task 01: Event-Driven Persistence and Non-Destructive Migration
 
 ## Status
-
-Pending
+Passed
 
 ## Outcome
 
@@ -105,4 +104,3 @@ Reviewer must run fresh and legacy D1 commands against separate temporary persis
 - dashboard/migrations/0002_dataset_generation.sql — read-only migration predecessor
 - dashboard/test/legacy-schema.sql — current legacy D1 fixture
 - dashboard/package.json — current Wrangler scripts
-

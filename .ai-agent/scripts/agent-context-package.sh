@@ -70,6 +70,7 @@ search_budget = env_int("SEARCH_BUDGET", 10, 1)
 configured_codegraph_depth = env_int("CODEGRAPH_DEPTH", 2, 0)
 lazy_knowledge = env_bool("LAZY_KNOWLEDGE", True)
 compact_review = env_bool("COMPACT_REVIEW", True)
+inline_reviewer_diff = env_bool("INLINE_REVIEWER_DIFF", False)
 repair_mode = env_bool("REPAIR_MODE", False)
 allow_runtime_log_read = env_bool("ALLOW_RUNTIME_LOG_READ", False) or repair_mode
 allow_history_search = env_bool("ALLOW_HISTORY_SEARCH", False)
@@ -133,6 +134,8 @@ RUNTIME_ALLOWLIST = {
     ".ai-agent/generated/runtime/reviewer-files.txt",
     ".ai-agent/generated/runtime/reviewer-scope.txt",
     ".ai-agent/generated/runtime/reviewer-diff.patch",
+    ".ai-agent/generated/runtime/reviewer-diff.sha256",
+    ".ai-agent/generated/runtime/reviewer-diff.meta.json",
     ".ai-agent/generated/runtime/loop-verdict.txt",
     ".ai-agent/generated/runtime/final-verdict.txt",
     ".ai-agent/generated/runtime/task-size.txt",
@@ -689,6 +692,8 @@ reviewer_summary = runtime / "reviewer-summary.md"
 reviewer_scope = runtime / "reviewer-scope.txt"
 reviewer_files_path = runtime / "reviewer-files.txt"
 reviewer_diff = runtime / "reviewer-diff.patch"
+reviewer_diff_hash = runtime / "reviewer-diff.sha256"
+reviewer_diff_meta = runtime / "reviewer-diff.meta.json"
 final_verdict = runtime / "final-verdict.txt"
 
 files = repo_files()
@@ -822,6 +827,8 @@ if role in {"reviewer", "reviewer-final"} or repair_mode:
         ".ai-agent/generated/runtime/reviewer-files.txt",
         ".ai-agent/generated/runtime/reviewer-scope.txt",
         ".ai-agent/generated/runtime/reviewer-diff.patch",
+        ".ai-agent/generated/runtime/reviewer-diff.sha256",
+        ".ai-agent/generated/runtime/reviewer-diff.meta.json",
     ]:
         search_allowlist.append(value)
 seen = set()
@@ -860,6 +867,7 @@ def build_sections(src_lines, knowledge_lines, codegraph_lines, diff_lines, incl
         "codegraph_depth": codegraph_depth_used,
         "lazy_knowledge": lazy_knowledge,
         "compact_review": compact_review,
+        "inline_reviewer_diff": inline_reviewer_diff,
         "repair_mode": repair_mode,
         "allow_runtime_log_read": allow_runtime_log_read,
         "allow_history_search": allow_history_search,
@@ -931,7 +939,11 @@ def build_sections(src_lines, knowledge_lines, codegraph_lines, diff_lines, incl
             sections.append(("review-scope", f"## Reviewer Scope\n\n```text\n{first_lines(reviewer_scope, 180)}```\n"))
         if reviewer_files_path.exists():
             sections.append(("review-files", f"## Reviewer Files\n\n```text\n{first_lines(reviewer_files_path, 180)}```\n"))
-        if reviewer_diff.exists():
+        if reviewer_diff_meta.exists():
+            sections.append(("review-diff-meta", f"## Reviewer Diff Delivery\n\nFull diff path: `.ai-agent/generated/runtime/reviewer-diff.patch`\n\n```json\n{first_lines(reviewer_diff_meta, 40)}```\n"))
+        elif reviewer_diff_hash.exists():
+            sections.append(("review-diff-meta", f"## Reviewer Diff Delivery\n\nFull diff path: `.ai-agent/generated/runtime/reviewer-diff.patch`\nHash: `{safe_read(reviewer_diff_hash, 256).strip()}`\n"))
+        if inline_reviewer_diff and reviewer_diff.exists():
             sections.append(("review-diff", f"## Reviewer Diff Excerpt\n\nPath: `.ai-agent/generated/runtime/reviewer-diff.patch`\n\n```diff\n{first_lines(reviewer_diff, diff_lines)}```\n"))
     if role in {"planner-final-fix", "reviewer-final-fix", "reviewer-final"} and final_verdict.exists():
         sections.append(("final-verdict", f"## Final Reviewer Verdict\n\n```text\n{first_lines(final_verdict, 180)}```\n"))

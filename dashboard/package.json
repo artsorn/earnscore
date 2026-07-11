@@ -9,7 +9,8 @@
     "d1:init": "wrangler d1 execute earnscore-db --local --file=schema.sql",
     "d1:init:prod": "wrangler d1 execute earnscore-db --remote --file=schema.sql",
     "d1:migrate": "wrangler d1 migrations apply earnscore-db --local",
-    "d1:migrate:prod": "wrangler d1 migrations apply earnscore-db --remote"
+    "d1:migrate:prod": "wrangler d1 migrations apply earnscore-db --remote",
+    "d1:verify": "wrangler d1 execute earnscore-db --local --command=\"SELECT COUNT(*) AS v3_tables FROM sqlite_master WHERE type='table' AND name IN ('sports','match_state_history','odds_current','odds_history','match_detail_sections','match_detail_data','assets','asset_links','feed_sessions','feed_events','detail_jobs','asset_jobs','recovery_jobs','sync_outbox','migration_audit');\""
   },
   "devDependencies": {
     "wrangler": "^3.60.0"

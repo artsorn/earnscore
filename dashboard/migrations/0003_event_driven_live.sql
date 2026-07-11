@@ -1,6 +1,7 @@
--- EarnScore v3 migration-compatible bootstrap.
--- Run d1:migrate after this file: historical 0001/0002 add and scope the
--- legacy base columns before 0003 completes the additive v3 conversion.
+-- Migration 0003_event_driven_live.sql
+-- Additive v3 objects and deterministic legacy conversion. This file uses
+-- create/insert/update operations only; historical migrations are untouched.
+-- EarnScore D1 v3 bootstrap.
 -- Historical migrations 0001 and 0002 are intentionally not copied or rewritten.
 -- Asset rows contain local storage keys and content hashes; no source image URL
 -- is part of the v3 asset contract.
@@ -15,6 +16,9 @@ CREATE TABLE IF NOT EXISTS datasets (
 INSERT OR IGNORE INTO datasets (dataset_id, created_at, generation_order, schema_generation)
 VALUES ('legacy-dataset-id', datetime('now'), 0, 3);
 
+UPDATE datasets SET schema_generation = 3
+WHERE schema_generation IS NULL OR schema_generation < 3;
+
 CREATE TABLE IF NOT EXISTS dataset_sports (
     dataset_id TEXT NOT NULL,
     sport_id INTEGER NOT NULL CHECK (sport_id IN (1, 2)),
@@ -22,6 +26,11 @@ CREATE TABLE IF NOT EXISTS dataset_sports (
     synced_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (dataset_id, sport_id)
 );
+
+-- 0002 owns the original dataset_sports contract.  Keep this alteration in
+-- 0003 so both a fresh bootstrap (followed by 0001/0002) and an existing D1
+-- database converge on the v3 projection flag without rewriting history.
+ALTER TABLE dataset_sports ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sports (
     id INTEGER PRIMARY KEY,
@@ -41,6 +50,9 @@ CREATE TABLE IF NOT EXISTS competitions (
     slug TEXT,
     country_name TEXT,
     country_logo TEXT,
+    raw_payload TEXT,
+    synced INTEGER DEFAULT 0,
+    updated_at TEXT,
     dataset_id TEXT NOT NULL,
     PRIMARY KEY (id, dataset_id)
 );
@@ -51,6 +63,9 @@ CREATE TABLE IF NOT EXISTS teams (
     name TEXT,
     logo TEXT,
     slug TEXT,
+    raw_payload TEXT,
+    synced INTEGER DEFAULT 0,
+    updated_at TEXT,
     dataset_id TEXT NOT NULL,
     PRIMARY KEY (id, dataset_id)
 );
@@ -117,6 +132,8 @@ CREATE TABLE IF NOT EXISTS matches (
     home_scores TEXT,
     away_scores TEXT,
     is_live INTEGER NOT NULL DEFAULT 0,
+    raw_payload TEXT,
+    synced INTEGER DEFAULT 0,
     updated_at TEXT,
     dataset_id TEXT NOT NULL,
     PRIMARY KEY (id, dataset_id)
@@ -187,7 +204,10 @@ CREATE TABLE IF NOT EXISTS match_details (
     lineups TEXT,
     odds TEXT,
     h2h TEXT,
+    raw_payload TEXT,
+    synced INTEGER DEFAULT 0,
     last_updated INTEGER,
+    updated_at TEXT,
     dataset_id TEXT NOT NULL,
     PRIMARY KEY (match_id, dataset_id)
 );
@@ -465,3 +485,240 @@ INSERT OR IGNORE INTO migration_audit
     (migration_id, version, status, started_at, completed_at, report_json)
 VALUES
     ('d1-v3-bootstrap', 3, 'COMPLETED', datetime('now'), datetime('now'), '{}');
+
+
+
+-- Convert the legacy JSON detail columns without removing the source row.
+-- Invalid JSON is represented as UNPARSEABLE with a reportable error; it is
+-- never coerced into fabricated structured data.
+WITH legacy_sections AS (
+    SELECT match_id, dataset_id, 'incidents' AS section_name, incidents AS section_value, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'stats', stats, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'lineups', lineups, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'odds', odds, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'h2h', h2h, last_updated FROM match_details
+)
+INSERT OR IGNORE INTO match_detail_sections
+    (match_id, dataset_id, section_name, status, provenance, is_empty,
+     is_unparseable, content_hash, source_timestamp, received_at,
+     completed_at, last_error)
+SELECT
+    match_id,
+    dataset_id,
+    section_name,
+    CASE
+        WHEN section_value IS NULL OR trim(section_value) = ''
+             OR trim(section_value) IN ('{}', '[]', 'null') THEN 'EMPTY'
+        WHEN json_valid(section_value) = 1 THEN 'COMPLETED'
+        ELSE 'UNPARSEABLE'
+    END,
+    'legacy:match_details.' || section_name,
+    CASE
+        WHEN section_value IS NULL OR trim(section_value) = ''
+             OR trim(section_value) IN ('{}', '[]', 'null') THEN 1
+        ELSE 0
+    END,
+    CASE
+        WHEN section_value IS NULL OR trim(section_value) = ''
+             OR trim(section_value) IN ('{}', '[]', 'null') THEN 0
+        WHEN json_valid(section_value) = 1 THEN 0
+        ELSE 1
+    END,
+    lower(hex(CAST(coalesce(section_value, '') AS BLOB))),
+    CAST(last_updated AS TEXT),
+    datetime('now'),
+    CASE WHEN json_valid(section_value) = 1
+              AND trim(section_value) NOT IN ('', '{}', '[]', 'null')
+         THEN datetime('now') ELSE NULL END,
+    CASE
+        WHEN section_value IS NULL OR trim(section_value) = ''
+             OR trim(section_value) IN ('{}', '[]', 'null') THEN NULL
+        WHEN json_valid(section_value) = 1 THEN NULL
+        ELSE 'legacy ' || section_name || ' is not valid JSON'
+    END
+FROM legacy_sections;
+
+WITH legacy_sections AS (
+    SELECT match_id, dataset_id, 'incidents' AS section_name, incidents AS section_value, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'stats', stats, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'lineups', lineups, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'odds', odds, last_updated FROM match_details
+    UNION ALL
+    SELECT match_id, dataset_id, 'h2h', h2h, last_updated FROM match_details
+)
+INSERT OR IGNORE INTO match_detail_data
+    (match_id, dataset_id, section_name, data_json, provenance,
+     content_hash, source_timestamp, received_at)
+SELECT
+    match_id,
+    dataset_id,
+    section_name,
+    CASE
+        WHEN section_value IS NULL OR trim(section_value) = '' THEN 'null'
+        WHEN json_valid(section_value) = 1 THEN section_value
+        ELSE NULL
+    END,
+    'legacy:match_details.' || section_name,
+    lower(hex(CAST(coalesce(section_value, '') AS BLOB))),
+    CAST(last_updated AS TEXT),
+    datetime('now')
+FROM legacy_sections;
+
+INSERT OR IGNORE INTO match_state_history
+    (match_id, dataset_id, sport_id, state, status_id, home_scores,
+     away_scores, source_timestamp, received_at, payload_hash, provenance)
+SELECT
+    id,
+    dataset_id,
+    sport_id,
+    CASE
+        WHEN status_id = 8 THEN 'FINISHED'
+        WHEN is_live = 1 THEN 'LIVE'
+        ELSE 'LEGACY_IMPORTED'
+    END,
+    status_id,
+    home_scores,
+    away_scores,
+    coalesce(updated_at, ''),
+    datetime('now'),
+    lower(hex(CAST(
+        id || '|' || coalesce(dataset_id, '') || '|' ||
+        coalesce(status_id, 0) || '|' ||
+        coalesce(home_scores, '') || '|' || coalesce(away_scores, '')
+        AS BLOB))),
+    'legacy:matches'
+FROM matches;
+
+-- Convert canonical array/object records only when all identifying fields
+-- are present. Other legacy odds remain in match_detail_data with an explicit
+-- section status and are listed by the local conversion report.
+WITH legacy_odds AS (
+    SELECT
+        d.match_id,
+        d.dataset_id,
+        CAST(d.last_updated AS TEXT) AS source_timestamp,
+        json_extract(item.value, '$.bookmaker_id') AS bookmaker_id,
+        json_extract(item.value, '$.market_type') AS market_type,
+        coalesce(json_extract(item.value, '$.period'), '') AS period,
+        json_extract(item.value, '$.selection_key') AS selection_key,
+        coalesce(json_extract(item.value, '$.line_value'), '') AS line_value,
+        CAST(json_extract(item.value, '$.odds_value') AS TEXT) AS odds_value,
+        item.value AS payload_json
+    FROM match_details AS d
+    JOIN json_each(
+        CASE
+            WHEN json_valid(d.odds) = 1 AND json_type(d.odds) = 'array'
+                THEN d.odds
+            WHEN json_valid(d.odds) = 1 AND json_type(d.odds) = 'object'
+                THEN json_array(json(d.odds))
+            ELSE json('[]')
+        END
+    ) AS item
+    WHERE json_valid(d.odds) = 1
+)
+INSERT OR IGNORE INTO odds_history
+    (match_id, dataset_id, bookmaker_id, market_type, period, selection_key,
+     line_value, odds_value, previous_odds_value, is_live, source_timestamp,
+     received_at, payload_hash, provenance, event_key)
+SELECT
+    match_id,
+    dataset_id,
+    CAST(bookmaker_id AS TEXT),
+    CAST(market_type AS TEXT),
+    CAST(period AS TEXT),
+    CAST(selection_key AS TEXT),
+    CAST(line_value AS TEXT),
+    odds_value,
+    NULL,
+    0,
+    coalesce(source_timestamp, ''),
+    datetime('now'),
+    lower(hex(CAST(payload_json AS BLOB))),
+    'legacy:match_details.odds',
+    'legacy:' || match_id || ':' || dataset_id || ':' ||
+        CAST(bookmaker_id AS TEXT) || ':' || CAST(market_type AS TEXT) || ':' ||
+        CAST(period AS TEXT) || ':' || CAST(selection_key AS TEXT) || ':' ||
+        CAST(line_value AS TEXT) || ':' || lower(hex(CAST(payload_json AS BLOB)))
+FROM legacy_odds
+WHERE bookmaker_id IS NOT NULL
+  AND market_type IS NOT NULL
+  AND selection_key IS NOT NULL
+  AND odds_value IS NOT NULL;
+
+WITH legacy_odds AS (
+    SELECT
+        d.match_id,
+        d.dataset_id,
+        CAST(d.last_updated AS TEXT) AS source_timestamp,
+        json_extract(item.value, '$.bookmaker_id') AS bookmaker_id,
+        json_extract(item.value, '$.market_type') AS market_type,
+        coalesce(json_extract(item.value, '$.period'), '') AS period,
+        json_extract(item.value, '$.selection_key') AS selection_key,
+        coalesce(json_extract(item.value, '$.line_value'), '') AS line_value,
+        CAST(json_extract(item.value, '$.odds_value') AS TEXT) AS odds_value,
+        item.value AS payload_json
+    FROM match_details AS d
+    JOIN json_each(
+        CASE
+            WHEN json_valid(d.odds) = 1 AND json_type(d.odds) = 'array'
+                THEN d.odds
+            WHEN json_valid(d.odds) = 1 AND json_type(d.odds) = 'object'
+                THEN json_array(json(d.odds))
+            ELSE json('[]')
+        END
+    ) AS item
+    WHERE json_valid(d.odds) = 1
+)
+INSERT OR REPLACE INTO odds_current
+    (match_id, dataset_id, bookmaker_id, market_type, period, selection_key,
+     line_value, odds_value, is_live, source_timestamp, received_at,
+     payload_hash, provenance)
+SELECT
+    match_id,
+    dataset_id,
+    CAST(bookmaker_id AS TEXT),
+    CAST(market_type AS TEXT),
+    CAST(period AS TEXT),
+    CAST(selection_key AS TEXT),
+    CAST(line_value AS TEXT),
+    odds_value,
+    0,
+    coalesce(source_timestamp, ''),
+    datetime('now'),
+    lower(hex(CAST(payload_json AS BLOB))),
+    'legacy:match_details.odds'
+FROM legacy_odds
+WHERE bookmaker_id IS NOT NULL
+  AND market_type IS NOT NULL
+  AND selection_key IS NOT NULL
+  AND odds_value IS NOT NULL;
+
+INSERT OR REPLACE INTO migration_audit
+    (migration_id, version, status, started_at, completed_at, report_json)
+VALUES (
+    'd1-v3-legacy-conversion',
+    3,
+    'COMPLETED',
+    datetime('now'),
+    datetime('now'),
+    json_object(
+        'matches_preserved', (SELECT count(*) FROM matches),
+        'details_seen', (SELECT count(*) FROM match_details),
+        'sections', (SELECT count(*) FROM match_detail_sections),
+        'unparseable_sections',
+            (SELECT count(*) FROM match_detail_sections WHERE is_unparseable = 1),
+        'odds_converted', (SELECT count(*) FROM odds_history),
+        'unmappable_fields', COALESCE(
+            (SELECT json_group_array(match_id || ':' || section_name)
+             FROM match_detail_sections WHERE is_unparseable = 1),
+            json('[]')
+        )
+    )
+);
