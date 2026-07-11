@@ -161,7 +161,8 @@ Commands:
   monitor [watch]     Show live runtime dashboard (use watch for refresh loop)
   tail                Follow live agent events log
   progress            Show task progress and current stage
-  restart             Clear runtime state for a new instruction/planning run
+  restart [--keep-plan]
+                      Archive and clear the old plan/runtime for a new plan
   reset-sessions      Clear saved Codex session ids only
   tokens              Show recorded Codex token usage
   task-files          Show implementation changed files, excluding agent state
@@ -418,46 +419,44 @@ case "$CMD" in
     bash "$AGENT_DIR/scripts/agent-progress.sh"
     ;;
   restart)
-    mkdir -p "$AGENT_DIR/generated/runtime"
+    keep_plan=false
+    case "${1:-}" in
+      "") ;;
+      --keep-plan) keep_plan=true; shift ;;
+      *) echo "Usage: .ai-agent/bin/aia restart [--keep-plan]" >&2; exit 2 ;;
+    esac
+    [[ "$#" -eq 0 ]] || { echo "Usage: .ai-agent/bin/aia restart [--keep-plan]" >&2; exit 2; }
+    runtime_dir="$AGENT_DIR/generated/runtime"
+    plan_dir="$AGENT_DIR/ai-plan"
+    mkdir -p "$runtime_dir"
     stamp="$(date -Iseconds)"
-    archive_stamp="$(date +%Y%m%d-%H%M%S)"
-    if [[ -s "$AGENT_DIR/generated/runtime/token-usage.jsonl" ]]; then
-      mv "$AGENT_DIR/generated/runtime/token-usage.jsonl" "$AGENT_DIR/generated/runtime/token-usage.$archive_stamp.jsonl"
+    archive_stamp="$(date +%Y%m%d-%H%M%S)-$$"
+    restart_backup="$AGENT_DIR/backups/restart-$archive_stamp"
+    if [[ "$keep_plan" != "true" ]]; then
+      if [[ -d "$plan_dir" ]] && find "$plan_dir" -mindepth 1 -type f ! -name '.gitkeep' -print -quit | grep -q .; then
+        mkdir -p "$restart_backup"
+        cp -a "$plan_dir" "$restart_backup/ai-plan"
+        echo "Archived previous plan: $restart_backup/ai-plan"
+      fi
+      rm -rf "$plan_dir"
+      mkdir -p "$plan_dir/tasks"
+      touch "$plan_dir/tasks/.gitkeep"
     fi
-    rm -f \
-      "$AGENT_DIR/generated/status.json" \
-      "$AGENT_DIR/generated/runtime/status.json" \
-      "$AGENT_DIR/generated/runtime/loop-verdict.txt" \
-      "$AGENT_DIR/generated/runtime/final-verdict.txt" \
-      "$AGENT_DIR/generated/runtime/runtime-context.md" \
-      "$AGENT_DIR/generated/runtime/context-package.md" \
-      "$AGENT_DIR/generated/runtime/context-package.meta.json" \
-      "$AGENT_DIR/generated/runtime/context-manifest.txt" \
-      "$AGENT_DIR/generated/runtime/context-escalation.txt" \
-      "$AGENT_DIR/generated/runtime/search-allowlist.txt" \
-      "$AGENT_DIR/generated/runtime/reviewer-summary.md" \
-      "$AGENT_DIR/generated/runtime/task-size.txt" \
-      "$AGENT_DIR/generated/runtime/task-type.txt" \
-      "$AGENT_DIR/generated/runtime/task-size.env" \
-      "$AGENT_DIR/generated/runtime/task-size.json" \
-      "$AGENT_DIR/generated/runtime/inferred-allowed-area.txt" \
-      "$AGENT_DIR/generated/runtime/planning-isolation.txt" \
-      "$AGENT_DIR/generated/runtime/reviewer-diff.patch" \
-      "$AGENT_DIR/generated/runtime/reviewer-files.txt" \
-      "$AGENT_DIR/generated/runtime/reviewer-scope.txt" \
-      "$AGENT_DIR/generated/runtime/merged-"*.prompt.md \
-      "$AGENT_DIR/generated/runtime/planner.log" \
-      "$AGENT_DIR/generated/runtime/reviewer-final.log" \
-      "$AGENT_DIR/generated/runtime/coder-"*.log \
-      "$AGENT_DIR/generated/runtime/reviewer-"*.log \
-      "$AGENT_DIR/generated/runtime/planner-"*.log \
-      "$AGENT_DIR/generated/runtime/reviewer-final-"*.log \
-      2>/dev/null || true
-    rm -rf "$AGENT_DIR/generated/runtime/task-checkpoints" 2>/dev/null || true
-    printf '%s [restart] runtime cleared for new instruction/planning run\n' "$stamp" >> "$AGENT_DIR/generated/runtime/events.log"
-    echo "Restarted agent runtime."
-    echo "Next: .ai-agent/bin/aia plan  # for a new plan"
-    echo "Next: .ai-agent/bin/aia run   # for pending tasks"
+    if [[ -s "$runtime_dir/token-usage.jsonl" ]]; then
+      mv "$runtime_dir/token-usage.jsonl" "$runtime_dir/token-usage.$archive_stamp.jsonl"
+    fi
+    rm -f "$AGENT_DIR/generated/status.json"
+    find "$runtime_dir" -mindepth 1 -type f ! -name 'token-usage.*.jsonl' -delete 2>/dev/null || true
+    find "$runtime_dir" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+    printf '%s [restart] runtime cleared; keep_plan=%s\n' "$stamp" "$keep_plan" > "$runtime_dir/events.log"
+    if [[ "$keep_plan" == "true" ]]; then
+      echo "Restarted runtime and kept the existing plan."
+      echo "Next: .ai-agent/bin/aia run  # continue existing pending tasks"
+    else
+      echo "Restarted for a new plan. Previous plan state was cleared."
+      echo "Requirement kept: .agent/requirement.md"
+      echo "Next: edit .agent/requirement.md, then run .ai-agent/bin/aia plan"
+    fi
     ;;
   reset-sessions)
     reset_role_sessions
@@ -745,6 +744,12 @@ DOCS
     fi
     if [[ -x scripts/agent-config-examples-test.sh ]]; then
       scripts/agent-config-examples-test.sh && echo "✓ config example tests" || { echo "✗ config example tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-restart-test.sh ]]; then
+      scripts/agent-restart-test.sh && echo "✓ restart tests" || { echo "✗ restart tests"; ok=0; }
+    fi
+    if [[ -x scripts/agent-planner-grill-format-test.sh ]]; then
+      scripts/agent-planner-grill-format-test.sh && echo "✓ planner grill format tests" || { echo "✗ planner grill format tests"; ok=0; }
     fi
     exit $(( ok == 1 ? 0 : 1 ))
     ;;

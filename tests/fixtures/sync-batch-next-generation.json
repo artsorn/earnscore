@@ -1,11 +1,11 @@
 {
   "protocol_version": 2,
-  "sync_id": "fixture-sync-a-football",
-  "dataset_id": "fixture-dataset-id",
-  "dataset_created_at": "2026-07-10T09:00:00.000Z",
-  "generation_order": 1783674000000,
+  "sync_id": "fixture-sync-b-football",
+  "dataset_id": "fixture-dataset-b",
+  "dataset_created_at": "2026-07-10T09:01:00.000Z",
+  "generation_order": 1783674060000,
   "sport_id": 1,
-  "captured_at": "2026-07-10T09:00:05.000Z",
+  "captured_at": "2026-07-10T09:01:05.000Z",
   "competitions": [
     {
       "id": "comp-foot-1",
@@ -15,7 +15,7 @@
       "slug": "premier-league",
       "country_name": "England",
       "country_logo": "https://example.com/logo-eng.png",
-      "dataset_id": "fixture-dataset-id"
+      "dataset_id": "fixture-dataset-b"
     }
   ],
   "teams": [
@@ -25,7 +25,7 @@
       "name": "Arsenal",
       "logo": "https://example.com/logo-ars.png",
       "slug": "arsenal",
-      "dataset_id": "fixture-dataset-id"
+      "dataset_id": "fixture-dataset-b"
     },
     {
       "id": "team-foot-2",
@@ -33,7 +33,7 @@
       "name": "Chelsea",
       "logo": "https://example.com/logo-che.png",
       "slug": "chelsea",
-      "dataset_id": "fixture-dataset-id"
+      "dataset_id": "fixture-dataset-b"
     }
   ],
   "matches": [
@@ -45,11 +45,11 @@
       "away_team_id": "team-foot-2",
       "match_time": 1700000000,
       "status_id": 2,
-      "home_scores": "[1,0,0,0,0]",
-      "away_scores": "[0,0,0,0,0]",
+      "home_scores": "[2,0,0,0,0]",
+      "away_scores": "[1,0,0,0,0]",
       "is_live": true,
-      "raw_payload": "{\"statusText\":\"First Half\",\"minute\":34,\"venue\":\"Fixture Stadium\",\"chat\":{\"messages\":[\"must be removed\"]}}",
-      "dataset_id": "fixture-dataset-id"
+      "raw_payload": "{\"statusText\":\"Second Half\",\"minute\":72,\"venue\":\"Fixture Stadium\"}",
+      "dataset_id": "fixture-dataset-b"
     }
   ],
   "match_details": [
@@ -57,13 +57,13 @@
       "match_id": "fixture-football-live",
       "sport_id": 1,
       "incidents": "[]",
-      "stats": "{\"shotsOnTarget\": [5, 3], \"shotsOffTarget\": [6, 4]}",
+      "stats": "{\"shotsOnTarget\": [7, 5], \"shotsOffTarget\": [8, 6]}",
       "lineups": "{}",
       "odds": "{}",
       "h2h": "{}",
-      "raw_payload": "{\"matchId\":\"fixture-football-live\",\"weather\":\"Clear\",\"activatedTabs\":[\"Overview\",\"Odds\",\"Stats\",\"H2H\",\"Lineups\",\"Standings\",\"Prediction\"],\"comments\":[\"must be removed\"]}",
-      "last_updated": 1700000200,
-      "dataset_id": "fixture-dataset-id"
+      "raw_payload": "{\"matchId\":\"fixture-football-live\",\"weather\":\"Clear\",\"activatedTabs\":[\"Overview\",\"Odds\",\"Stats\",\"H2H\",\"Lineups\",\"Standings\",\"Prediction\"]}",
+      "last_updated": 1700000400,
+      "dataset_id": "fixture-dataset-b"
     }
   ]
 }

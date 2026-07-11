@@ -24,6 +24,7 @@ Usage:
   .ai-agent/scripts/agent-planner-grill.sh next
   .ai-agent/scripts/agent-planner-grill.sh approve
   .ai-agent/scripts/agent-planner-grill.sh freeze
+  .ai-agent/scripts/agent-planner-grill.sh validate-questions <questions.md>
 
 Files:
   .agent/requirement.md
@@ -111,7 +112,15 @@ write_answer_placeholder() {
   cat > "$path" <<EOF
 # Planner Grill Answers - Round $(printf '%03d' "$round")
 
-ตอบคำถามของ Planner ใต้ไฟล์นี้
+ตอบสั้น ๆ ด้วยหมายเลขตัวเลือก หรือกำหนดเอง เช่น:
+
+Q1: 1
+Q2: 3
+Q3: CUSTOM - ใช้แนวทาง ... เพราะ ...
+
+ถ้าต้องการเลือกข้อที่ AI แนะนำทุกคำถาม ให้ตอบ:
+
+USE ALL AI RECOMMENDATIONS
 
 ถ้าแผนพร้อม freeze แล้ว ให้ใส่บรรทัดใดบรรทัดหนึ่งแบบเดี่ยว ๆ:
 
@@ -121,6 +130,115 @@ APPROVED
 
 PLAN APPROVED
 EOF
+}
+
+print_grill_question_contract() {
+  cat <<'EOF'
+
+# Required Choice Format for Every Grill Question
+
+Ask no more than 5 blocker questions per round. Every question must use this exact Markdown structure and literal field labels:
+
+```md
+## Q1: <specific decision in one short sentence>
+**Why this matters:** <one short sentence explaining impact>
+
+1. **<recommended choice>** [AI RECOMMENDED]
+   - Explanation: <one or two short sentences>
+   - Example: <one short concrete result or scenario>
+2. **<alternative choice>**
+   - Explanation: <one or two short sentences>
+   - Example: <one short concrete result or scenario>
+3. **<alternative choice>**
+   - Explanation: <one or two short sentences>
+   - Example: <one short concrete result or scenario>
+4. **<alternative choice>**
+   - Explanation: <one or two short sentences>
+   - Example: <one short concrete result or scenario>
+
+**Custom:** Describe a different choice and the result you expect.
+```
+
+Choice rules:
+- Choice 1 must always be the AI recommendation and must include `[AI RECOMMENDED]` exactly.
+- Choices 2-4 must be realistic, distinct alternatives with meaningful tradeoffs, not filler.
+- Each Explanation must be concise and make the consequence understandable to a non-expert.
+- Each Example must be one short, concrete output, UI behavior, data shape, command result, or user flow.
+- Preserve the literal labels `Explanation:`, `Example:`, and `**Custom:**`; question content may be in the user's language.
+- Do not put `[AI RECOMMENDED]` on choices 2-4.
+- Do not ask open-ended questions outside this structure.
+- If fewer than four safe alternatives exist, use conservative variations in scope, behavior, or implementation strategy; do not omit an option.
+- If no blocker remains, write no question blocks and state `No blocker questions were written by Planner.`
+EOF
+}
+
+validate_grill_questions() {
+  local path="$1"
+  [[ -s "$path" ]] || { echo "Grill questions file is missing or empty: $path" >&2; return 1; }
+  python3 - "$path" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="replace")
+headers = list(re.finditer(r"(?m)^## Q([1-9][0-9]*):\s+\S.*$", text))
+
+if not headers:
+    if "No blocker questions were written by Planner." in text:
+        raise SystemExit(0)
+    print(f"Invalid grill questions: {path}", file=sys.stderr)
+    print("Expected at least one '## Q1: ...' block or the no-blocker sentence.", file=sys.stderr)
+    raise SystemExit(1)
+
+errors = []
+if len(headers) > 5:
+    errors.append(f"found {len(headers)} questions; maximum is 5")
+
+numbers = [int(match.group(1)) for match in headers]
+if numbers != list(range(1, len(headers) + 1)):
+    errors.append(f"question numbers must be sequential from Q1; found {numbers}")
+
+for index, header in enumerate(headers):
+    qnum = int(header.group(1))
+    end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+    block = text[header.start():end]
+    if not re.search(r"(?m)^\*\*Why this matters:\*\*\s+\S", block):
+        errors.append(f"Q{qnum}: missing '**Why this matters:**'")
+
+    option_matches = list(re.finditer(r"(?m)^([1-4])\. \*\*(\S.*?)\*\*(?: \[AI RECOMMENDED\])?\s*$", block))
+    option_numbers = [int(match.group(1)) for match in option_matches]
+    if option_numbers != [1, 2, 3, 4]:
+        errors.append(f"Q{qnum}: choices must be exactly 1, 2, 3, 4; found {option_numbers}")
+        continue
+
+    recommended_lines = re.findall(r"(?m)^[1-4]\. .*\[AI RECOMMENDED\]\s*$", block)
+    if len(recommended_lines) != 1 or not recommended_lines[0].startswith("1. "):
+        errors.append(f"Q{qnum}: choice 1 must be the only [AI RECOMMENDED] choice")
+
+    for opt_index, match in enumerate(option_matches):
+        opt_num = int(match.group(1))
+        opt_end = option_matches[opt_index + 1].start() if opt_index + 1 < len(option_matches) else len(block)
+        option_block = block[match.end():opt_end]
+        if not re.search(r"(?m)^\s+- Explanation:\s+\S", option_block):
+            errors.append(f"Q{qnum} choice {opt_num}: missing Explanation")
+        if not re.search(r"(?m)^\s+- Example:\s+\S", option_block):
+            errors.append(f"Q{qnum} choice {opt_num}: missing Example")
+
+    if not re.search(r"(?m)^\*\*Custom:\*\*\s+\S", block):
+        errors.append(f"Q{qnum}: missing '**Custom:**'")
+
+    if re.search(r"(?m)^[5-9]\. \*\*", block):
+        errors.append(f"Q{qnum}: numeric choices beyond 4 are not allowed")
+
+if errors:
+    print(f"Invalid grill questions: {path}", file=sys.stderr)
+    for error in errors:
+        print(f"- {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"Valid grill choice format: {path}")
+PY
 }
 
 prepare_planner_context() {
@@ -224,6 +342,7 @@ Questions must cover:
 
 Do not implement code.
 EOF
+    print_grill_question_contract
   } > "$prompt_file"
 }
 
@@ -244,6 +363,12 @@ Inputs to read:
 - $answers_file
 - .agent/requirement.md
 - .ai-agent/generated/runtime/context-package.md if present
+
+Answer syntax to interpret:
+- `Q1: 1` means select numbered choice 1 for Q1.
+- `Q1: CUSTOM - ...` means use the user's custom decision for Q1.
+- `USE ALL AI RECOMMENDATIONS` means select choice 1 for every unanswered question in that round.
+- Free-form notes after a choice refine that selected choice and must not be ignored.
 
 Required outputs:
 - Write the revised plan to $revised_file
@@ -271,6 +396,7 @@ Revised plan must include:
 
 Do not implement code.
 EOF
+    print_grill_question_contract
   } > "$prompt_file"
 }
 
@@ -319,6 +445,7 @@ cmd_start() {
   run_planner_grill_prompt "start" "$prompt_file" "$log_file"
   assert_no_final_plan_modified "$marker"
   [[ -s "$questions_file" ]] || die "Planner did not write $questions_file"
+  validate_grill_questions "$questions_file" || die "Planner wrote invalid choice questions. See the format errors above."
   cp "$questions_file" "$GRILL_DIR/questions.md"
   write_answer_placeholder "$answers_file" "$round"
   cp "$answers_file" "$GRILL_DIR/answers.md"
@@ -362,6 +489,7 @@ If the revised plan is acceptable, write APPROVED or PLAN APPROVED in answers.md
 If not, write the remaining concerns or corrections.
 EOF
   fi
+  validate_grill_questions "$next_questions" || die "Planner wrote invalid choice questions. See the format errors above."
   cp "$next_questions" "$GRILL_DIR/questions.md"
   write_answer_placeholder "$(round_file "$next_round" "answers")" "$next_round"
   cp "$(round_file "$next_round" "answers")" "$GRILL_DIR/answers.md"
@@ -408,6 +536,7 @@ case "${1:-}" in
   next|grill-next) cmd_next ;;
   approve) cmd_approve ;;
   freeze) cmd_freeze ;;
+  validate-questions) [[ -n "${2:-}" ]] || die "questions file required"; validate_grill_questions "$2" ;;
   -h|--help|help|"") usage ;;
   *) usage >&2; exit 2 ;;
 esac

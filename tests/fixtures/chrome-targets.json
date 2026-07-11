@@ -1,0 +1,72 @@
+[
+  {
+    "_comment": "Unowned football list tab (pre-existing user tab — must not be hijacked or closed)",
+    "id": "unowned-user-foot-tab",
+    "type": "page",
+    "url": "https://m.aiscore.com/",
+    "title": "AiScore - Football",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/unowned-user-foot-tab",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/unowned-user-foot-tab",
+    "description": ""
+  },
+  {
+    "_comment": "Unowned basketball tab (pre-existing user tab — must not be hijacked or closed)",
+    "id": "unowned-user-bask-tab",
+    "type": "page",
+    "url": "https://m.aiscore.com/basketball",
+    "title": "AiScore - Basketball",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/unowned-user-bask-tab",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/unowned-user-bask-tab",
+    "description": ""
+  },
+  {
+    "_comment": "Dedicated crawler-owned football list target (created by this session via PUT /json/new)",
+    "id": "owned-crawler-foot-list",
+    "type": "page",
+    "url": "https://m.aiscore.com/",
+    "title": "AiScore - Football [crawler-owned]",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/owned-crawler-foot-list",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/owned-crawler-foot-list",
+    "description": "role:list sport:football session:crawler-2026"
+  },
+  {
+    "_comment": "Dedicated crawler-owned basketball list target (created by its own session)",
+    "id": "owned-crawler-bask-list",
+    "type": "page",
+    "url": "https://m.aiscore.com/basketball",
+    "title": "AiScore - Basketball [crawler-owned]",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/owned-crawler-bask-list",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/owned-crawler-bask-list",
+    "description": "role:list sport:basketball session:crawler-2026"
+  },
+  {
+    "_comment": "Detail target for football match foot-match-1 (owned, should be closed after save)",
+    "id": "owned-detail-foot-match-1",
+    "type": "page",
+    "url": "https://m.aiscore.com/match-arsenal-chelsea/foot-match-1",
+    "title": "Arsenal vs Chelsea - Match Detail",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/owned-detail-foot-match-1",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/owned-detail-foot-match-1",
+    "description": "role:detail match:foot-match-1 sport:football"
+  },
+  {
+    "_comment": "Detail target for basketball match bask-match-1 (owned, should be closed after save)",
+    "id": "owned-detail-bask-match-1",
+    "type": "page",
+    "url": "https://m.aiscore.com/match-basketball-lakers-celtics/bask-match-1",
+    "title": "Lakers vs Celtics - Match Detail",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/owned-detail-bask-match-1",
+    "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9223/devtools/page/owned-detail-bask-match-1",
+    "description": "role:detail match:bask-match-1 sport:basketball"
+  },
+  {
+    "_comment": "Unowned browser target (extension/devtools background) — must never be touched",
+    "id": "devtools-bg-worker",
+    "type": "background_page",
+    "url": "chrome-extension://abcdef/background.js",
+    "title": "DevTools Background",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/devtools-bg-worker",
+    "devtoolsFrontendUrl": "",
+    "description": ""
+  }
+]

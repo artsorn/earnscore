@@ -1,68 +1,190 @@
-# Planning Context
+# EarnScore Event-Driven Live Feed — Execution Context
 
-## Current Requirement Interpretation
+## Project shape
 
-Requirement รอบนี้เป็นการซ่อม implementation ที่ผ่านแผนเดิมแล้ว ไม่ใช่ขยาย feature ใหม่ทั่วไป โดยมี observable failures สามกลุ่ม:
+The current repository is intentionally small but concentrated:
 
-1. ข้อมูลผิด/relations ผิดเมื่อเปิด feed — ต้องกลับไปยืนยัน source runtime ด้วย Chrome DevTools และสร้าง fixtures จาก shape จริง
-2. ข้อมูลถูกอ่านเร็วเกินไป — ต้องมี minimum delay + readiness/stability predicates และ match-specific validation
-3. ลบ `local.db` แล้วยังเห็นข้อมูลเดิม — ต้องแยก local SQLite lifecycle ออกจาก D1/dashboard lifecycle ด้วย dataset generation และ no-cache behavior
+- src/main.rs contains CLI parsing, Chrome target management, Football/Basketball adapters, extraction, SQLite migration/persistence, detail collection, sync and Rust tests.
+- dashboard/src/index.js contains Worker routes, D1 operations and the embedded Dashboard HTML/CSS/client JavaScript.
+- dashboard/schema.sql is the fresh D1 bootstrap.
+- dashboard/migrations/0001_full_payload.sql and 0002_dataset_generation.sql are historical applied migrations.
+- dashboard/test/legacy-schema.sql seeds the old D1 shape for migration verification.
+- tests/fixtures contains sanitized Football, Basketball, detail, filter, target and sync fixtures.
 
-คำว่า “new tab เพื่อเก็บข้อมูลพร้อมๆ กัน” ตีความเป็น crawler-created Chrome targets: dedicated list tab ต่อ sport session และ bounded detail/feed target pool เพื่อเก็บหลาย match พร้อมกัน โดยไม่ใช้ tab ผู้ใช้ร่วมกันและไม่สร้าง tabs แบบไร้ขีดจำกัด
+The approved implementation progressively extracts Rust responsibilities into new modules. Do not perform a broad rewrite of unrelated code in one task.
 
-## Current Project Map
+## Approved architecture
 
-- `src/main.rs` เป็น monolithic Rust entrypoint (~2,000 lines) มี adapters, target selection, SQLite migrations/upserts, D1 sync, CDP router/event loop, iframe detail helper และ unit tests
-- `Cargo.toml` มี `tokio`, `tokio-tungstenite`, `reqwest`, `rusqlite`, `serde`, `uuid`, `rand` ซึ่งเพียงพอสำหรับ target orchestration/generation โดยควรหลีกเลี่ยง dependency ใหม่ถ้าไม่จำเป็น
-- `dashboard/src/index.js` รวม Worker routes และ embedded dashboard; `/api/matches/live` อ่าน D1 และไม่มี concept ของ local DB generation
-- `dashboard/schema.sql` และ `dashboard/migrations/0001_full_payload.sql` เป็น schema ปัจจุบัน; entity PK ยังเป็น upstream ID และไม่มี `dataset_id`
-- fixtures ปัจจุบันมี football/basketball live/finished และ sync batch แต่เป็น simplified shapes; ยังไม่มี target-list, Live-filter readiness หรือ real detail hydration fixtures
+    owned headless Chrome/Chromium
+      -> Football and Basketball feed adapters
+      -> normalized, sanitized event envelope
+      -> admission/state/odds processors
+      -> SQLite transaction
+           feed event log
+           Match snapshot/history/current odds
+           durable section/recovery jobs
+           asset metadata
+           sync outbox
+      -> leased detail, asset, recovery and sync workers
+      -> Cloudflare D1 and R2
+      -> versioned REST + required aliases + SSE
+      -> Live / History / Match Detail Dashboard
 
-## Evidence from Current Source
+## Identity and migration contract
 
-- `FootballAdapter::extract_state_js` อ่าน `football/home` หรือ `home`; `BasketballAdapter` อ่าน `basketball` หรือ `basketball/player` และเลือก `matchesData_* | matches | list` โดยไม่มี source-version/readiness metadata
-- `activate_live_js()` หา element ที่ text เท่ากับ `live` และ click แต่ caller เรียกเฉพาะเมื่อ extracted state เป็น null; state ที่มีข้อมูลแต่เป็น filter อื่นจึงผ่านได้
-- initial event ถูก queue ทันทีหลัง script injection; navigation รอ fixed 5 วินาที, iframe detail รอ fixed 3 วินาทีหลัง load และ timeout 15 วินาที
-- `get_websocket_url()` ใช้ matching tab ที่มีอยู่ก่อน แล้ว fallback ไป generic tab; ไม่มี target owner/session ID
-- detail helper อยู่ใน list tab และอ่าน module ตาม `sportId`; response ยืนยันเพียงว่ามี `matchId`, แต่ lifecycle ของ iframe/store reuse ยังไม่แยก target
-- CLI log `cli.db_path` ตาม input ไม่ resolve absolute path/DB identity. Dashboard อ่าน D1 จึงเป็นคนละ persistence layer กับ file ที่ผู้ใช้ลบ
+- Existing Match IDs remain public canonical IDs.
+- Existing dataset metadata remains supported, but dataset generation cannot bypass the live-only admission rule.
+- Historical migrations 0001 and 0002 are read-only references.
+- New D1 changes start in dashboard/migrations/0003_event_driven_live.sql.
+- Local SQLite migration is repeat-safe and additive.
+- Migration begins with a verified backup and supports restore.
+- Legacy Match detail is converted into section status/content rows without inventing unavailable values.
+- Legacy raw odds are converted with provenance; unparseable values are reported, not fabricated.
+- Legacy image URLs may be read only during the Task 05 one-time in-memory asset conversion. They are removed from the active DB only after the corresponding asset is safely stored; the verified backup retains the original legacy data.
+- Legacy API aliases remain until a separately approved removal release.
 
-## Source Discovery Rules
+## Event and state contract
 
-- Task 05 Coder ต้องใช้ Chrome DevTools MCP กับ `https://m.aiscore.com/` และ `https://m.aiscore.com/basketball` ขณะเลือก All และ Live เพื่อเปรียบเทียบ DOM active marker, network responses, Vue/Nuxt store และ detail page hydration
-- Prefer network response contract เป็น primary source เมื่อ response body/IDs เชื่อม relations ได้; store/DOM เป็น readiness/fallback เท่านั้น. ถ้าต้องใช้ store ให้ระบุ exact module path และ invariant ที่ fixture/tests ยืนยัน
-- ต้องสร้าง sanitized fixtures จาก actual shape โดยลดข้อมูลเหลือ minimum reproducible fields และตัด chat. ห้าม commit full production payload, token, cookie หรือ personal/browser data
-- status IDs และ score indices ต้องแยกต่อกีฬาและยืนยันด้วย live + finished examples; ห้ามใช้ mapping เดิมโดยไม่มี evidence
+Required normalized event types:
 
-## Dataset Generation Decision
+- FEED_CONNECTED
+- FEED_DISCONNECTED
+- FEED_HEARTBEAT
+- MATCH_DISCOVERED_LIVE
+- MATCH_SCORE_CHANGED
+- MATCH_CLOCK_CHANGED
+- MATCH_PERIOD_CHANGED
+- MATCH_STATUS_CHANGED
+- MATCH_ODDS_CHANGED
+- MATCH_REMOVED_FROM_LIVE
+- MATCH_FINISHED
 
-- SQLite file แต่ละไฟล์มี persistent `dataset_id` UUID ใน settings/metadata; สร้างครั้งเดียวเมื่อ DB ใหม่และคงเดิมตลอดอายุ file
-- normalized rows และ sync payload ทุกชนิดต้องระบุ `dataset_id`. D1 เก็บ generation บน rows และมี active dataset metadata
-- เมื่อ sync generation ใหม่ครั้งแรก Worker เปลี่ยน active generation แบบ atomic; list/detail APIs filter active generation จึงไม่แสดง unmatched old rows
-- Entity PK เดิมอาจคงไว้ได้หาก upsert เปลี่ยน `dataset_id` ของ rows ที่เห็นใน generation ใหม่ และ filter ซ่อน rows ที่ไม่ถูกส่งใหม่. Migration design ต้องพิสูจน์ behavior นี้กับ overlapping IDs และ old-only IDs ก่อนเลือก composite key
-- สอง CLI processes ที่เปิด DB เดียวกันต้องอ่าน generation เดียวกันภายใต้ transaction. DB ต่าง path คือคนละ generation และต้อง log/warn เพื่อให้ operator เห็น
-- DB unlink/replacement ขณะรันต้องตรวจด้วย canonical path + file identity/generation probe ก่อน persistence/sync. ห้ามใช้ connection/claimed rows จาก generation เก่าหลัง detect replacement
+Every envelope carries event ID, optional source event ID, Match ID, sport ID, event type, source timestamp, received timestamp, payload hash, sanitized payload and feed session ID.
 
-## Readiness and Concurrency Decisions
+When a source timestamp is absent, idempotency uses Match ID, event type and normalized payload hash. Snapshot ordering uses source time when reliable, then received time and a deterministic tie-breaker.
 
-- minimum navigation/detail delay เป็น CLI-configurable milliseconds แต่ success ต้องขึ้นกับ predicate: correct URL, document ready, Live active marker, expected store/response present และ snapshot stable อย่างน้อยสอง probes
-- timeout ต้องคืน typed failure/retry ไม่ persist empty/partial payload. Logs ระบุ target ID, sport, match ID, stage และ elapsed time
-- list target หนึ่งตัวต่อ process; detail targets มี bounded concurrency ด้วย semaphore/queue. Target ที่สร้างต้อง track owner/session ID และปิดใน success, timeout, cancellation และ reconnect paths
-- detail save ต้องตรวจ requested match ID == hydrated match ID และ relation to current dataset/sport; response จาก match ก่อนหน้าต้อง discard
+## Internal Match states
 
-## D1 and Dashboard Decisions
+- DISCOVERED_LIVE
+- LIVE
+- HALF_TIME
+- PAUSED
+- FINISHING
+- FINISHED
+- CANCELLED
+- POSTPONED
+- ABANDONED
+- RECOVERY_PENDING
+- FINALIZED
+- UNKNOWN
 
-- D1 เป็น durable remote store จึงไม่ควรถูกลบอัตโนมัติเมื่อ local file หาย; correctness มาจาก active-generation filtering
-- `/api/sync` ต้องรับ/validate generation, activate safely และ acknowledge generation เดียวกับ batch. Rust mark synced เฉพาะ acknowledgement ที่ตรงกัน
-- `/api/matches/live` response ควรมี dataset ID, generation activation/freshness timestamps และ empty state เมื่อ generation ใหม่ยังไม่มี sport data
-- `/api/matches/detail` ต้อง join/validate match กับ active generation ไม่ใช่ lookup `match_id` อย่างเดียว
-- API/client fetch ใช้ `Cache-Control: no-store`/`cache: 'no-store'`; UI แสดง source generation/freshness เพื่อแยก “ไม่มีข้อมูลใหม่” จาก “โหลดล้มเหลว”
+UNKNOWN_TERMINAL is modeled as a recovery outcome, not a new canonical Match admission state.
 
-## Constraints
+## Detail and recovery contract
 
-- Current runtime classification: LARGE, detail level high, maximum 8 task files
-- Task 01–04 เดิมมีสถานะ Passed; active repair uses Task 05–08 เพื่อให้รวมทั้งหมดไม่เกิน 8
-- implementation ใช้ Rust เป็นหลักและคง JavaScript Worker/UI ตามโครงสร้างเดิม
-- ไม่อ่าน runtime logs/history ใน repair mode false; plan อาศัย compact package, generated knowledge และ targeted current sources เท่านั้น
-- implementation scope ของ task ต้องไม่รวม `.ai-agent/**`, root `AGENTS.md`, `.gitignore` หรือ agent state
+Detail sections include Overview, Odds, H2H, Lineups, Stats, Incidents/Timeline and related competition/team/venue/referee/player data.
+
+Section states:
+
+- PENDING
+- LOADING
+- COMPLETED
+- EMPTY_CONFIRMED
+- FAILED_RETRYABLE
+- FAILED_PERMANENT
+- FINAL_REFRESH_PENDING
+- FINAL_COMPLETED
+
+Job identity is Match ID + section + phase, where phase is INITIAL, RETRY, FINAL or MANUAL.
+
+Recovery selects only Matches that were previously Live, are not Finalized and lost feed before a known terminal result. It never crawls all historical Matches.
+
+## Asset contract
+
+- Source URLs exist only in an active in-memory download attempt.
+- New job/event/outbox rows never contain source image URLs.
+- Downloads validate status, Content-Type and actual image bytes.
+- Assets are SHA-256 deduplicated and atomically renamed.
+- Active DB fields store asset IDs, local paths, storage keys and image metadata.
+- Dashboard requests only internal asset routes or the configured internal R2 domain.
+- Retry after restart reacquires the URL from the source detail page.
+
+## API contract
+
+Canonical versioned routes use the /api/v1 prefix.
+
+Required read routes also remain available at the requirement paths:
+
+- /api/live/matches
+- /api/live/events
+- /api/matches/{match_id} and section subroutes
+- /api/assets/{asset_id}
+- /api/feed/status
+
+Existing routes such as /api/matches/live and /api/matches/detail remain compatibility aliases during cutover.
+
+Admin routes:
+
+- /api/admin/feed/restart
+- /api/admin/matches/{match_id}/retry-missing
+- /api/admin/matches/{match_id}/force-finalize
+- /api/admin/assets/{asset_id}/retry
+- /api/admin/recovery-jobs
+- /api/admin/detail-jobs
+
+SSE uses durable cursor IDs and supports heartbeat, Last-Event-ID, gap detection and REST resync.
+
+## Configuration defaults
+
+- detail concurrency: 3
+- asset concurrency: 5
+- recovery concurrency: 2
+- heartbeat: 5 seconds
+- stale timeout: 20 seconds
+- recovery grace: 6 hours
+- finished-card grace: 3 minutes
+- retry schedule: 10 seconds, 30 seconds, 2 minutes, 5 minutes, 15 minutes with jitter
+
+All values are configurable and validated to prevent zero-delay loops or unbounded concurrency.
+
+## Security and legal boundaries
+
+- No source cookies, tokens, auth headers or unsanitized HTML/state/network samples in DB or logs.
+- Admin secrets come from existing auth or environment configuration; never from committed defaults.
+- Do not copy source HTML, CSS, JavaScript, screenshots, logos or trademarks.
+- Do not iframe or proxy source HTML.
+- Do not bypass source access controls.
+- Visual tests use EarnScore-owned components and deterministic fixtures.
+
+## Validation conventions
+
+Rust tasks run formatting and focused test filters before the full suite:
+
+    cargo fmt -- --check
+    cargo test
+
+Worker tasks run:
+
+    node --check dashboard/src/index.js
+    cd dashboard && npx wrangler deploy --dry-run
+
+D1 migration tests use separate temporary persist directories for fresh and legacy paths. Destructive commands are prohibited against production/user databases.
+
+Dashboard tasks use Playwright with deterministic D1/HTTP fixtures and must test Desktop, Tablet, Mobile, Live, Finished, incomplete detail and no-lineup states.
+
+## Review stop conditions
+
+Reviewer must stop the task if any of the following occurs:
+
+- a Scheduled or never-seen-live Finished Match is created
+- Match IDs change during migration
+- a completed detail section reloads without an allowed phase
+- a source image URL or secret persists in active storage/logs
+- a parser mismatch writes state or marks a Match terminal
+- an old event overwrites newer state
+- initial and final jobs run concurrently
+- final refresh repeats in the same version
+- an outbox replay duplicates domain history
+- a legacy route changes semantics before cutover approval
+- implementation touches a Forbidden File
 

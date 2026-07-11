@@ -1,0 +1,53 @@
+{
+  "_metadata": {
+    "url_surface": "https://m.aiscore.com/",
+    "capture_layer": "store",
+    "sanitized_capture_date": "2026-07-10"
+  },
+  "all_state": {
+    "activeFilter": "all",
+    "sportId": 1,
+    "matches": [
+      {
+        "id": "foot-match-1",
+        "competition": { "id": "comp-foot" },
+        "homeTeam": { "id": "team-foot-1" },
+        "awayTeam": { "id": "team-foot-2" },
+        "matchTime": 1700000000,
+        "statusId": 1,
+        "homeScores": [0],
+        "awayScores": [0]
+      }
+    ],
+    "teams": [
+      { "id": "team-foot-1", "name": "Arsenal", "slug": "arsenal" },
+      { "id": "team-foot-2", "name": "Chelsea", "slug": "chelsea" }
+    ],
+    "competitions": [
+      { "id": "comp-foot", "name": "Premier League", "slug": "premier-league" }
+    ]
+  },
+  "live_state": {
+    "activeFilter": "live",
+    "sportId": 1,
+    "matches": [
+      {
+        "id": "foot-match-1",
+        "competition": { "id": "comp-foot" },
+        "homeTeam": { "id": "team-foot-1" },
+        "awayTeam": { "id": "team-foot-2" },
+        "matchTime": 1700000000,
+        "statusId": 2,
+        "homeScores": [1],
+        "awayScores": [0]
+      }
+    ],
+    "teams": [
+      { "id": "team-foot-1", "name": "Arsenal", "slug": "arsenal" },
+      { "id": "team-foot-2", "name": "Chelsea", "slug": "chelsea" }
+    ],
+    "competitions": [
+      { "id": "comp-foot", "name": "Premier League", "slug": "premier-league" }
+    ]
+  }
+}

@@ -1,3 +1,4 @@
+-- Migration 0002_dataset_generation.sql
 CREATE TABLE IF NOT EXISTS datasets (
     dataset_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -5,6 +6,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     schema_generation INTEGER NOT NULL DEFAULT 2
 );
 
+-- Insert the legacy dataset ID so it exists in registry
 INSERT OR IGNORE INTO datasets (dataset_id, created_at, generation_order, schema_generation)
 VALUES ('legacy-dataset-id', datetime('now'), 0, 2);
 
@@ -16,7 +18,8 @@ CREATE TABLE IF NOT EXISTS dataset_sports (
     PRIMARY KEY (dataset_id, sport_id)
 );
 
-CREATE TABLE IF NOT EXISTS competitions (
+-- competitions table
+CREATE TABLE IF NOT EXISTS competitions_new (
     id TEXT,
     sport_id INTEGER,
     name TEXT,
@@ -31,7 +34,15 @@ CREATE TABLE IF NOT EXISTS competitions (
     PRIMARY KEY (id, dataset_id)
 );
 
-CREATE TABLE IF NOT EXISTS teams (
+INSERT INTO competitions_new (id, sport_id, name, logo, slug, country_name, country_logo, raw_payload, synced, updated_at, dataset_id)
+SELECT id, sport_id, name, logo, slug, country_name, country_logo, raw_payload, synced, updated_at, 'legacy-dataset-id'
+FROM competitions;
+
+DROP TABLE competitions;
+ALTER TABLE competitions_new RENAME TO competitions;
+
+-- teams table
+CREATE TABLE IF NOT EXISTS teams_new (
     id TEXT,
     sport_id INTEGER,
     name TEXT,
@@ -44,7 +55,15 @@ CREATE TABLE IF NOT EXISTS teams (
     PRIMARY KEY (id, dataset_id)
 );
 
-CREATE TABLE IF NOT EXISTS matches (
+INSERT INTO teams_new (id, sport_id, name, logo, slug, raw_payload, synced, updated_at, dataset_id)
+SELECT id, sport_id, name, logo, slug, raw_payload, synced, updated_at, 'legacy-dataset-id'
+FROM teams;
+
+DROP TABLE teams;
+ALTER TABLE teams_new RENAME TO teams;
+
+-- matches table
+CREATE TABLE IF NOT EXISTS matches_new (
     id TEXT,
     sport_id INTEGER,
     competition_id TEXT,
@@ -62,12 +81,21 @@ CREATE TABLE IF NOT EXISTS matches (
     PRIMARY KEY (id, dataset_id)
 );
 
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
+INSERT INTO matches_new (id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores, is_live, raw_payload, synced, updated_at, dataset_id)
+SELECT id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores,
+       CASE
+         WHEN sport_id = 1 AND status_id IN (2, 3, 4, 5, 6, 7) THEN 1
+         WHEN sport_id = 2 AND status_id IN (2, 3, 4, 5, 6, 7, 9) THEN 1
+         ELSE 0
+       END,
+       raw_payload, synced, updated_at, 'legacy-dataset-id'
+FROM matches;
 
-CREATE TABLE IF NOT EXISTS match_details (
+DROP TABLE matches;
+ALTER TABLE matches_new RENAME TO matches;
+
+-- match_details table
+CREATE TABLE IF NOT EXISTS match_details_new (
     match_id TEXT,
     sport_id INTEGER,
     incidents TEXT,
@@ -83,6 +111,22 @@ CREATE TABLE IF NOT EXISTS match_details (
     PRIMARY KEY (match_id, dataset_id)
 );
 
+INSERT INTO match_details_new (match_id, sport_id, incidents, stats, lineups, odds, h2h, raw_payload, synced, last_updated, updated_at, dataset_id)
+SELECT match_id, sport_id, incidents, stats, lineups, odds, h2h, raw_payload, synced, last_updated, updated_at, 'legacy-dataset-id'
+FROM match_details;
+
+DROP TABLE match_details;
+ALTER TABLE match_details_new RENAME TO match_details;
+
+-- Recreate indexes
+DROP INDEX IF EXISTS idx_matches_list;
+DROP INDEX IF EXISTS idx_matches_competition;
+DROP INDEX IF EXISTS idx_matches_home_team;
+DROP INDEX IF EXISTS idx_matches_away_team;
+DROP INDEX IF EXISTS idx_match_details_lookup;
+DROP INDEX IF EXISTS idx_competitions_sport;
+DROP INDEX IF EXISTS idx_teams_sport;
+
 CREATE INDEX IF NOT EXISTS idx_matches_list ON matches (dataset_id, is_live, sport_id, status_id, match_time);
 CREATE INDEX IF NOT EXISTS idx_matches_competition ON matches (dataset_id, competition_id);
 CREATE INDEX IF NOT EXISTS idx_matches_home_team ON matches (dataset_id, home_team_id);
@@ -91,8 +135,3 @@ CREATE INDEX IF NOT EXISTS idx_match_details_lookup ON match_details (dataset_id
 CREATE INDEX IF NOT EXISTS idx_competitions_sport ON competitions (dataset_id, sport_id);
 CREATE INDEX IF NOT EXISTS idx_teams_sport ON teams (dataset_id, sport_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_sports_ready ON dataset_sports (dataset_id, sport_id);
-
-INSERT OR IGNORE INTO settings (key, value) VALUES ('sync_interval_mins', '5');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('api_token', 'super-secret-token');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('detail_update_interval_secs', '60');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('cf_worker_url', 'http://127.0.0.1:8080');

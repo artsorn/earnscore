@@ -45,5 +45,14 @@ CREATE TABLE IF NOT EXISTS match_details (
     last_updated INTEGER
 );
 
+INSERT OR IGNORE INTO competitions (id, sport_id, name, logo, slug, country_name, country_logo)
+VALUES ('legacy-comp', 1, 'Premier League', 'logo.png', 'premier-league', 'England', 'flag.png');
+
+INSERT OR IGNORE INTO teams (id, sport_id, name, logo, slug)
+VALUES ('legacy-team', 1, 'Arsenal', 'logo.png', 'arsenal');
+
 INSERT OR IGNORE INTO matches (id, sport_id, competition_id, home_team_id, away_team_id, match_time, status_id, home_scores, away_scores, updated_at)
-VALUES ('legacy-match', 1, 'comp-1', 'team-1', 'team-2', 1700000000, 1, '[]', '[]', '2026-07-10 00:00:00');
+VALUES ('legacy-match', 1, 'legacy-comp', 'legacy-team', 'legacy-team', 1700000000, 1, '[]', '[]', '2026-07-10 00:00:00');
+
+INSERT OR IGNORE INTO match_details (match_id, sport_id, incidents, stats, lineups, odds, h2h, last_updated)
+VALUES ('legacy-match', 1, '[]', '{}', '{}', '{}', '{}', 1700000000);

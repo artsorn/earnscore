@@ -151,6 +151,42 @@ $EDITOR .ai-agent/ai-plan/grill/answers.md
 .ai-agent/bin/aia plan grill-next
 ```
 
+ทุกคำถามจะแสดง 4 ทางเลือกพร้อมคำอธิบายและตัวอย่างผลลัพธ์สั้น ๆ โดยตัวเลือก 1 เป็นข้อที่ AI แนะนำเสมอ และมี `Custom` สำหรับกำหนดเอง เช่น:
+
+```md
+## Q1: ควรเก็บข้อมูลย้อนหลังนานเท่าไร?
+**Why this matters:** ระยะเวลาเก็บข้อมูลมีผลต่อค่าใช้จ่ายและหน้ารายงาน
+
+1. **เก็บ 90 วัน** [AI RECOMMENDED]
+   - Explanation: สมดุลระหว่างแนวโน้มที่ดูได้กับพื้นที่จัดเก็บ
+   - Example: เปิดกราฟย้อนหลังได้ประมาณสามเดือน
+2. **เก็บ 30 วัน**
+   - Explanation: ประหยัดพื้นที่ แต่ดูแนวโน้มระยะยาวไม่ได้
+   - Example: รายงานเดือนก่อนยังอยู่ แต่ไตรมาสก่อนหายไป
+3. **เก็บ 1 ปี**
+   - Explanation: เหมาะกับการเปรียบเทียบตามฤดูกาล
+   - Example: เปรียบเทียบกับเดือนเดียวกันของปีก่อนได้
+4. **ไม่ลบอัตโนมัติ**
+   - Explanation: ได้ประวัติครบ แต่ต้องดูแล archive เอง
+   - Example: ข้อมูลอยู่จนกว่าผู้ดูแลจะลบ
+
+**Custom:** ระบุจำนวนวันและผลลัพธ์ที่ต้องการ
+```
+
+ตอบใน `answers.md` แบบสั้นได้:
+
+```text
+Q1: 1
+Q2: 3
+Q3: CUSTOM - เก็บ 180 วันและ export ก่อนลบ
+```
+
+หรือเลือกข้อแนะนำทั้งหมด:
+
+```text
+USE ALL AI RECOMMENDATIONS
+```
+
 เมื่อครบให้ใส่ `PLAN APPROVED` แล้วรัน:
 
 ```bash
@@ -239,7 +275,7 @@ node --test
 
 ## 10. Requirement รอบใหม่
 
-แก้ `.agent/requirement.md` แล้ว:
+ตรวจว่า implementation จากแผนเดิมถูก commit/stash ตามต้องการก่อน จากนั้นแก้ `.agent/requirement.md` แล้วรัน:
 
 ```bash
 .ai-agent/bin/aia restart
@@ -248,7 +284,20 @@ node --test
 .ai-agent/bin/aia run
 ```
 
-`restart` ไม่ลบ source, config หรือ token archive
+`restart` จะ:
+
+- archive แผนเดิมไว้ที่ `.ai-agent/backups/restart-<timestamp>/ai-plan/`
+- ล้าง `overview.md`, `context.md`, task files และ grill state เดิม
+- ล้าง status, verdict, role sessions, task checkpoints, prompts และ logs เดิม
+- archive token usage ปัจจุบันเป็น `token-usage.<timestamp>.jsonl`
+- คง source code, `.agent/requirement.md`, config, codegraph และ knowledge ไว้
+
+ถ้าต้องการล้าง runtime แต่ทำ pending tasks ในแผนเดิมต่อ ให้ใช้:
+
+```bash
+.ai-agent/bin/aia restart --keep-plan
+.ai-agent/bin/aia run
+```
 
 ## 11. Token Controls ที่แนะนำ
 

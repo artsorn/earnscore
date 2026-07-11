@@ -1,0 +1,23 @@
+{
+  "_metadata": {
+    "url_surface": "https://m.aiscore.com/match-arsenal-chelsea/foot-match-1",
+    "capture_layer": "store",
+    "sanitized_capture_date": "2026-07-10"
+  },
+  "matchId": "foot-match-1",
+  "sportId": 1,
+  "name": "Arsenal vs Chelsea",
+  "incidents": [
+    { "time": 12, "type": "goal", "player": "Saka" }
+  ],
+  "stats": {
+    "possession": [55, 45]
+  },
+  "lineups": {
+    "home": [],
+    "away": []
+  },
+  "odds": {},
+  "h2h": {},
+  "chat": "ignored"
+}

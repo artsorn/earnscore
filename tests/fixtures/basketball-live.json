@@ -1,4 +1,11 @@
 {
+  "_metadata": {
+    "url_surface": "https://m.aiscore.com/basketball",
+    "capture_layer": "store",
+    "sanitized_capture_date": "2026-07-10"
+  },
+  "activeFilter": "live",
+  "sportId": 2,
   "matches": [
     {
       "id": "bask-match-1",
